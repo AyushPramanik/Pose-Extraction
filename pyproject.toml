@@ -1,9 +1,15 @@
 [project]
 name = "pose-detection"
 version = "0.1.0"
-description = "Add your description here"
+description = "Subtle movement extraction for seated subjects listening to music (OpenPose via YOLO-Pose)"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.9"
 dependencies = [
-    "mediapipe>=0.10.33",
+    "ultralytics>=8.0",
+    "opencv-contrib-python>=4.8",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+    "pillow>=10.0",
 ]
