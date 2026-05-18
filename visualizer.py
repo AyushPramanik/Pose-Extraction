@@ -36,7 +36,75 @@ def annotate_frame(frame: np.ndarray, persons: list[dict], confidence: float = 0
     return out
 
 
-def render_annotated_video(video_path: str, frames_data: list[dict], output_path: str) -> None:
+# BGR values matching EMOTION_COLORS hex codes
+_EMOTION_BGR = {
+    'excited':    (50,  165, 244),
+    'engaged':    (142, 175,  76),
+    'calm':       (214, 174, 107),
+    'disengaged': (176, 176, 176),
+    'agitated':   (82,   82, 224),
+}
+
+
+def _lookup_state(states: list[dict], timestamp: float) -> tuple[str, str, float]:
+    for s in states:
+        if s['start_time'] <= timestamp <= s['end_time']:
+            return s['emotion'], s['actions'], float(s['confidence'])
+    best = min(states, key=lambda s: abs(s['mid_time'] - timestamp))
+    return best['emotion'], best['actions'], float(best['confidence'])
+
+
+def _draw_label_overlay(
+    frame: np.ndarray,
+    emotion: str,
+    actions: str,
+    confidence: float,
+) -> np.ndarray:
+    h, w = frame.shape[:2]
+    pad = max(8, h // 80)
+    font_scale = max(0.4, h / 1200)
+    thick = 1 if h < 800 else 2
+
+    line1 = f"{emotion}  {confidence:.0%}"
+    line2 = actions if actions else "still"
+
+    (tw1, th1), bl1 = cv2.getTextSize(line1, cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.1, thick)
+    (tw2, th2), bl2 = cv2.getTextSize(line2, cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.9, thick)
+
+    box_w = max(tw1, tw2) + pad * 4 + 10
+    box_h = th1 + th2 + pad * 3
+    x1, y1 = pad, pad
+    x2, y2 = x1 + box_w, y1 + box_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    # Colored stripe on the left edge of the box
+    stripe_color = _EMOTION_BGR.get(emotion, (180, 180, 180))
+    cv2.rectangle(frame, (x1, y1), (x1 + 6, y2), stripe_color, -1)
+
+    # Emotion label (bright white)
+    cv2.putText(frame, line1,
+                (x1 + 12, y1 + pad + th1),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale * 1.1,
+                (255, 255, 255), thick, cv2.LINE_AA)
+
+    # Actions label (light grey)
+    cv2.putText(frame, line2,
+                (x1 + 12, y1 + pad * 2 + th1 + th2),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.9,
+                (190, 190, 190), thick, cv2.LINE_AA)
+
+    return frame
+
+
+def render_annotated_video(
+    video_path: str,
+    frames_data: list[dict],
+    output_path: str,
+    states_df: "pd.DataFrame | None" = None,
+) -> None:
     cap = cv2.VideoCapture(video_path)
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -45,12 +113,22 @@ def render_annotated_video(video_path: str, frames_data: list[dict], output_path
     writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
     frame_map = {f['frame_idx']: f['persons'] for f in frames_data}
+
+    states_list = None
+    if states_df is not None and not states_df.empty:
+        states_list = states_df[
+            ['start_time', 'end_time', 'mid_time', 'emotion', 'actions', 'confidence']
+        ].to_dict('records')
+
     idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         annotated = annotate_frame(frame, frame_map.get(idx, []))
+        if states_list is not None:
+            emotion, actions, conf = _lookup_state(states_list, idx / fps)
+            annotated = _draw_label_overlay(annotated, emotion, actions, conf)
         writer.write(annotated)
         idx += 1
 

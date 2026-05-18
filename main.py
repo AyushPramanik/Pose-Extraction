@@ -97,29 +97,22 @@ def main() -> None:
         json.dump(summary, f, indent=2)
     print(f"      {feat_df.shape[1] - 3} feature columns computed")
 
-    # ── 4. visualisation ──────────────────────────────────────────────────────
-    print("\n[4/4] Generating outputs...")
-    plot_movement_features(feat_df, summary, str(out / f'{stem}_movement_plot.png'))
-
-    if args.annotate_video:
-        render_annotated_video(args.video, frames, str(out / f'{stem}_annotated.mp4'))
-
-    # ── 5. behavioral classification (optional) ───────────────────────────────
+    # ── 4. behavioral classification (optional) ───────────────────────────────
+    states_df = None
     if args.classify:
-        print("\n[5/5] Running behavioral state classifier...")
+        print("\n[4/5] Running behavioral state classifier...")
         clf = BehavioralClassifier(fps, window_secs=args.window_secs)
         states_df, behav_summary = clf.analyze(feat_df, norm_df)
 
-        states_path  = out / f'{stem}_behavioral_states.csv'
-        bsumm_path   = out / f'{stem}_behavioral_summary.json'
+        states_path   = out / f'{stem}_behavioral_states.csv'
+        bsumm_path    = out / f'{stem}_behavioral_summary.json'
         timeline_path = out / f'{stem}_emotion_timeline.png'
 
         states_df.to_csv(states_path, index=False)
         with open(bsumm_path, 'w') as f:
             json.dump(behav_summary, f, indent=2)
 
-        plot_emotion_timeline(states_df, feat_df, behav_summary,
-                              str(timeline_path))
+        plot_emotion_timeline(states_df, feat_df, behav_summary, str(timeline_path))
 
         print(f"\n=== Behavioral Summary ===")
         print(f"  Dominant emotion  : {behav_summary.get('dominant_emotion', '-')}")
@@ -130,6 +123,17 @@ def main() -> None:
         for a, v in sorted(behav_summary.get('action_fractions', {}).items(), key=lambda x: -x[1]):
             print(f"    {a:<20} {v:.1%}")
         print(f"  Outputs → {states_path.name}, {bsumm_path.name}, {timeline_path.name}")
+
+    # ── 5. visualisation ──────────────────────────────────────────────────────
+    print("\n[5/5] Generating outputs...")
+    plot_movement_features(feat_df, summary, str(out / f'{stem}_movement_plot.png'))
+
+    if args.annotate_video:
+        render_annotated_video(
+            args.video, frames,
+            str(out / f'{stem}_annotated.mp4'),
+            states_df=states_df,
+        )
 
     # ── movement summary print ────────────────────────────────────────────────
     print("\n=== Movement Summary ===")
