@@ -24,7 +24,8 @@ from feature_extractor import (
     compute_features,
     compute_summary,
 )
-from visualizer import render_annotated_video, plot_movement_features
+from emotion_classifier import BehavioralClassifier
+from visualizer import render_annotated_video, plot_movement_features, plot_emotion_timeline
 
 
 def main() -> None:
@@ -48,6 +49,10 @@ def main() -> None:
                         help='Process every (N+1)th frame. 0 = every frame.')
     parser.add_argument('--annotate-video', action='store_true',
                         help='Write a copy of the video with pose skeleton overlaid.')
+    parser.add_argument('--classify', action='store_true',
+                        help='Run the behavioral state classifier and produce emotion outputs.')
+    parser.add_argument('--window-secs', type=float, default=2.0,
+                        help='Classifier window length in seconds (default: 2.0).')
     parser.add_argument('--load-poses', metavar='JSON',
                         help='Skip extraction and load a previously saved _poses.json.')
     args = parser.parse_args()
@@ -99,7 +104,34 @@ def main() -> None:
     if args.annotate_video:
         render_annotated_video(args.video, frames, str(out / f'{stem}_annotated.mp4'))
 
-    # ── summary print ─────────────────────────────────────────────────────────
+    # ── 5. behavioral classification (optional) ───────────────────────────────
+    if args.classify:
+        print("\n[5/5] Running behavioral state classifier...")
+        clf = BehavioralClassifier(fps, window_secs=args.window_secs)
+        states_df, behav_summary = clf.analyze(feat_df, norm_df)
+
+        states_path  = out / f'{stem}_behavioral_states.csv'
+        bsumm_path   = out / f'{stem}_behavioral_summary.json'
+        timeline_path = out / f'{stem}_emotion_timeline.png'
+
+        states_df.to_csv(states_path, index=False)
+        with open(bsumm_path, 'w') as f:
+            json.dump(behav_summary, f, indent=2)
+
+        plot_emotion_timeline(states_df, feat_df, behav_summary,
+                              str(timeline_path))
+
+        print(f"\n=== Behavioral Summary ===")
+        print(f"  Dominant emotion  : {behav_summary.get('dominant_emotion', '-')}")
+        fracs = behav_summary.get('emotion_fractions', {})
+        for e, v in sorted(fracs.items(), key=lambda x: -x[1]):
+            print(f"  {e:<18} {v:.1%} of clip")
+        print(f"  Action fractions  :")
+        for a, v in sorted(behav_summary.get('action_fractions', {}).items(), key=lambda x: -x[1]):
+            print(f"    {a:<20} {v:.1%}")
+        print(f"  Outputs → {states_path.name}, {bsumm_path.name}, {timeline_path.name}")
+
+    # ── movement summary print ────────────────────────────────────────────────
     print("\n=== Movement Summary ===")
     keys_to_show = [
         'head_lateral_freq_hz', 'head_vertical_freq_hz',

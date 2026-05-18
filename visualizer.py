@@ -2,9 +2,19 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 import pandas as pd
 
 from pose_extractor import KEYPOINT_NAMES, POSE_CONNECTIONS
+
+# Consistent colours for each emotion label
+EMOTION_COLORS = {
+    'excited':    '#f4a532',
+    'engaged':    '#4caf8e',
+    'calm':       '#6baed6',
+    'disengaged': '#b0b0b0',
+    'agitated':   '#e05252',
+}
 
 
 # ── video annotation ──────────────────────────────────────────────────────────
@@ -138,3 +148,111 @@ def plot_movement_features(
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Movement plot → {output_path}")
+
+
+# ── emotion timeline plot ─────────────────────────────────────────────────────
+
+def plot_emotion_timeline(
+    results_df: pd.DataFrame,
+    feat_df: pd.DataFrame,
+    summary: dict,
+    output_path: str,
+    title: str = "Behavioral State Analysis",
+) -> None:
+    """
+    Three-panel figure:
+      1. Emotion timeline (colour blocks per window)
+      2. Movement energy with emotion colouring
+      3. Action presence heatmap
+    """
+    if results_df.empty:
+        print("No behavioral results to plot.")
+        return
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), gridspec_kw={'height_ratios': [1.2, 2, 2]})
+    fig.subplots_adjust(hspace=0.45)
+
+    t_min = float(results_df['start_time'].min())
+    t_max = float(results_df['end_time'].max())
+
+    # ── panel 1: emotion timeline ─────────────────────────────────────────────
+    ax1 = axes[0]
+    ax1.set_xlim(t_min, t_max)
+    ax1.set_ylim(0, 1)
+    ax1.set_yticks([])
+    ax1.set_xlabel('Time (s)')
+    ax1.set_title('Emotion Timeline', fontweight='bold')
+
+    for _, row in results_df.iterrows():
+        color = EMOTION_COLORS.get(row['emotion'], '#cccccc')
+        ax1.axvspan(row['start_time'], row['end_time'], ymin=0, ymax=1,
+                    alpha=0.75, color=color)
+        mid = (row['start_time'] + row['end_time']) / 2
+        ax1.text(mid, 0.5, row['emotion'], ha='center', va='center',
+                 fontsize=7, rotation=90 if (row['end_time'] - row['start_time']) < 1.5 else 0,
+                 clip_on=True)
+
+    # legend
+    patches = [mpatches.Patch(color=c, label=e)
+               for e, c in EMOTION_COLORS.items()
+               if e in summary.get('emotion_fractions', {})]
+    ax1.legend(handles=patches, loc='upper right', fontsize=7,
+               bbox_to_anchor=(1.0, 1.35), ncol=len(patches))
+
+    # ── panel 2: movement energy coloured by emotion ──────────────────────────
+    ax2 = axes[1]
+    speed_cols = [c for c in feat_df.columns if c.endswith('_speed')]
+    if speed_cols:
+        t = feat_df['time']
+        energy = feat_df[speed_cols].mean(axis=1).fillna(0)
+        ax2.fill_between(t, energy, alpha=0.25, color='steelblue')
+        ax2.plot(t, energy, color='steelblue', linewidth=0.8, alpha=0.8)
+
+        # shade background by emotion windows
+        for _, row in results_df.iterrows():
+            color = EMOTION_COLORS.get(row['emotion'], '#cccccc')
+            ax2.axvspan(row['start_time'], row['end_time'], alpha=0.12, color=color)
+
+    ax2.set_xlim(t_min, t_max)
+    ax2.set_ylim(bottom=0)
+    ax2.set_title('Movement Energy (background = inferred emotion)', fontweight='bold')
+    ax2.set_ylabel('mean speed')
+    ax2.set_xlabel('Time (s)')
+
+    # ── panel 3: action heatmap ───────────────────────────────────────────────
+    ax3 = axes[2]
+    action_labels = ['still', 'nodding', 'head_shaking', 'gesturing', 'arm_raised',
+                     'active', 'moving']
+    present = [a for a in action_labels
+               if a in summary.get('action_fractions', {})]
+    if present:
+        n_actions = len(present)
+        mat = np.zeros((n_actions, len(results_df)))
+        for j, row in enumerate(results_df.itertuples()):
+            acts = row.actions.split(',')
+            for i, a in enumerate(present):
+                mat[i, j] = 1.0 if a in acts else 0.0
+
+        mid_times = results_df['mid_time'].values
+        ax3.pcolormesh(mid_times, np.arange(n_actions), mat,
+                       cmap='YlOrRd', vmin=0, vmax=1, shading='nearest')
+        ax3.set_yticks(np.arange(n_actions) + 0.5)
+        ax3.set_yticklabels(present, fontsize=9)
+        ax3.set_xlabel('Time (s)')
+        ax3.set_title('Detected Actions', fontweight='bold')
+        ax3.set_xlim(t_min, t_max)
+    else:
+        ax3.set_visible(False)
+
+    # ── annotation box ────────────────────────────────────────────────────────
+    dom = summary.get('dominant_emotion', 'unknown')
+    dur = summary.get('total_duration_s', 0)
+    fracs = summary.get('emotion_fractions', {})
+    frac_str = '  '.join(f"{e}: {v:.0%}" for e, v in sorted(fracs.items(), key=lambda x: -x[1]))
+    info = f"Dominant: {dom}   |   Duration: {dur:.1f}s   |   {frac_str}"
+    fig.text(0.5, 0.01, info, ha='center', fontsize=9, style='italic', color='#444444')
+
+    plt.suptitle(title, fontsize=13, fontweight='bold')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Emotion timeline → {output_path}")
