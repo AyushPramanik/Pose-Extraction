@@ -12,4 +12,5 @@ dependencies = [
     "scipy>=1.11",
     "matplotlib>=3.7",
     "pillow>=10.0",
+    "supervision>=0.21",
 ]

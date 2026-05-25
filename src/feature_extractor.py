@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from typing import Optional
 from scipy import signal
 from scipy.fft import fft, fftfreq
 
@@ -10,7 +11,7 @@ TORSO     = ['left_hip', 'right_hip']
 UPPER     = HEAD + SHOULDERS + ARMS + TORSO
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ==================== helpers ====================
 
 def _smooth(s: pd.Series, window: int = 7) -> pd.Series:
     """Savitzky-Golay filter after linear interpolation over missing samples."""
@@ -53,15 +54,50 @@ def _joint_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     return np.where(valid, np.degrees(np.arccos(cos_a)), np.nan)
 
 
-# ── public API ────────────────────────────────────────────────────────────────
+# ==================== public functions ====================
 
-def poses_to_dataframe(frames: list[dict], person_idx: int = 0) -> pd.DataFrame:
-    """Flatten per-frame pose data into a wide DataFrame (one row per sample)."""
+def get_tracker_ids(frames: list[dict]) -> list[int]:
+    """Return sorted list of unique tracker IDs seen across all frames."""
+    seen: set[int] = set()
+    for f in frames:
+        for p in f['persons']:
+            tid = p.get('tracker_id')
+            if tid is not None:
+                seen.add(int(tid))
+    return sorted(seen)
+
+
+def poses_to_dataframe(
+        frames: list[dict],
+        person_id: Optional[int] = None,
+        person_idx: int = 0,
+    ) -> pd.DataFrame:
+    """
+    Flatten per-frame pose data into a wide DataFrame (one row per sample).
+
+    Args:
+        frames:     Output of PoseExtractor.extract_from_video / load_from_json.
+        person_id:  Stable tracker ID assigned by ByteTrack.  When provided,
+                    each frame is searched for a person whose tracker_id matches.
+                    Takes precedence over person_idx.
+        person_idx: Fallback array index (used for old JSON files without tracker IDs,
+                    or when person_id is None).
+    """
     records = []
     for f in frames:
         row: dict = {'frame': f['frame_idx'], 'sample': f['sample_idx'], 'time': f['timestamp']}
-        if person_idx < len(f['persons']):
-            for kp, val in f['persons'][person_idx].items():
+
+        # Select the target person for this frame
+        person: Optional[dict] = None
+        if person_id is not None:
+            person = next((p for p in f['persons'] if p.get('tracker_id') == person_id), None)
+        elif person_idx < len(f['persons']):
+            person = f['persons'][person_idx]
+
+        if person is not None:
+            for kp, val in person.items():
+                if kp == 'tracker_id':
+                    continue  # metadata key, not a keypoint
                 if val:
                     row[f'{kp}_x'] = val['x']
                     row[f'{kp}_y'] = val['y']
@@ -70,6 +106,7 @@ def poses_to_dataframe(frames: list[dict], person_idx: int = 0) -> pd.DataFrame:
                     row[f'{kp}_x'] = np.nan
                     row[f'{kp}_y'] = np.nan
                     row[f'{kp}_c'] = 0.0
+
         records.append(row)
     return pd.DataFrame(records)
 
@@ -83,9 +120,10 @@ def normalize_to_torso(df: pd.DataFrame) -> pd.DataFrame:
     norm = df.copy()
     lx, ly = 'left_shoulder_x', 'left_shoulder_y'
     rx, ry = 'right_shoulder_x', 'right_shoulder_y'
-    if not all(c in df.columns for c in [lx, ly, rx, ry]):
+    if not all(c in df.columns for c in [lx, ly, rx, ry]):                        # Skip normalization if shoulders are missing
         return norm
 
+    # Compute torso center
     ref_x = (df[lx] + df[rx]) / 2
     ref_y = (df[ly] + df[ry]) / 2
     width = np.sqrt((df[lx] - df[rx]) ** 2 + (df[ly] - df[ry]) ** 2)

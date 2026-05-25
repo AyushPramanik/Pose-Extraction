@@ -2,6 +2,8 @@
 __pycache__/
 *.py[oc]
 *.egg-info
+logs/
+.claude/
 
 # Virtual environments
 .venv
