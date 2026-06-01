@@ -23,6 +23,8 @@ The pipeline flows through four stages, each handled by a dedicated module:
 ### 1. **Pose Extraction** (`pose_extractor.py`)
 - Wraps the ultralytics YOLO-Pose model (default: `yolov8x-pose.pt`, larger models are more accurate)
 - Processes video frames and outputs 17-keypoint skeleton in COCO format
+- Tracks each person with lightweight frame-to-frame box matching and writes
+  stable `tracker_id` values plus bounding boxes
 - Saves raw per-frame keypoint data (pixel coordinates + confidence) to JSON
 - Model variants:
   - `yolov8n-pose` → fastest, lowest accuracy
@@ -44,7 +46,7 @@ The pipeline flows through four stages, each handled by a dedicated module:
 - **Frequency analysis:** FFT-based dominant frequency detection for each keypoint (Hz)
 
 ### 3. **Visualization** (`visualizer.py`)
-- **Annotated video:** Overlays pose skeleton (green lines) and keypoint markers on original video
+- **Annotated video:** Overlays bounding boxes, tracker IDs, pose skeletons, and keypoint markers on original video
 - **Movement plot:** 6-panel figure showing:
   1. Head movement speed (nose, ears)
   2. Arm movement speed (wrists, elbows)
@@ -53,7 +55,7 @@ The pipeline flows through four stages, each handled by a dedicated module:
   5. Overall body movement energy (area fill)
   6. Per-keypoint mean speed bar chart
 
-### 4. **Pipeline Orchestration** (`main.py`)
+### 4. **Pipeline Orchestration** (`run_detection.py`)
 - CLI entry point; chains the above stages
 - Optionally loads pre-computed poses (`--load-poses`) to skip re-detection
 - Outputs 7 files per input video:
@@ -71,42 +73,42 @@ The pipeline flows through four stages, each handled by a dedicated module:
 
 ### Extract poses from a video (full pipeline)
 ```bash
-python main.py recording.mov -o output
+python -m src.run_detection recording.mov -o output
 ```
 
 ### Use a faster model
 ```bash
-python main.py recording.mov --checkpoint yolov8n-pose.pt
+python -m src.run_detection recording.mov --checkpoint yolov8n-pose.pt
 ```
 
 ### Use a more accurate model
 ```bash
-python main.py recording.mov --checkpoint yolo11x-pose.pt
+python -m src.run_detection recording.mov --checkpoint yolo11x-pose.pt
 ```
 
 ### Lower confidence threshold (catch subtler poses, add noise)
 ```bash
-python main.py recording.mov --confidence 0.10
+python -m src.run_detection recording.mov --confidence 0.10
 ```
 
 ### Skip every other frame (2× faster processing, half the detail)
 ```bash
-python main.py recording.mov --skip-frames 1
+python -m src.run_detection recording.mov --skip-frames 1
 ```
 
 ### Extract with annotated video overlay
 ```bash
-python main.py recording.mov --annotate-video
+python -m src.run_detection recording.mov --annotate-video
 ```
 
 ### Recompute features without re-running detection
 ```bash
-python main.py recording.mov --load-poses output/recording_poses.json
+python -m src.run_detection recording.mov --load-poses output/recording_poses.json
 ```
 
 ### Extract from a different person in multi-person video
 ```bash
-python main.py recording.mov --person 1
+python -m src.run_detection recording.mov --person-ids 1
 ```
 
 ---
@@ -183,7 +185,7 @@ Head & shoulder composites:
 | `pose_extractor.py` | YOLO-Pose wrapper; keypoint detection from video |
 | `feature_extractor.py` | Torso normalization, kinematics, FFT, aggregate stats |
 | `visualizer.py` | Annotated video rendering and 6-panel plot |
-| `main.py` | CLI orchestrator; chains all stages |
+| `run_detection.py` | CLI orchestrator; chains all stages |
 | `RESULTS.md` | Format guide for all outputs (output file schemas) |
 | `pyproject.toml` | Dependencies: ultralytics, opencv, numpy, pandas, scipy, matplotlib |
 

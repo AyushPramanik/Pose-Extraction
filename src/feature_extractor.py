@@ -9,6 +9,7 @@ SHOULDERS = ['left_shoulder', 'right_shoulder']
 ARMS      = ['left_elbow', 'right_elbow', 'left_wrist', 'right_wrist']
 TORSO     = ['left_hip', 'right_hip']
 UPPER     = HEAD + SHOULDERS + ARMS + TORSO
+PERSON_METADATA_KEYS = {'tracker_id', 'bbox'}
 
 
 # ==================== helpers ====================
@@ -77,7 +78,7 @@ def poses_to_dataframe(
 
     Args:
         frames:     Output of PoseExtractor.extract_from_video / load_from_json.
-        person_id:  Stable tracker ID assigned by ByteTrack.  When provided,
+        person_id:  Stable tracker ID assigned by the box tracker.  When provided,
                     each frame is searched for a person whose tracker_id matches.
                     Takes precedence over person_idx.
         person_idx: Fallback array index (used for old JSON files without tracker IDs,
@@ -95,8 +96,17 @@ def poses_to_dataframe(
             person = f['persons'][person_idx]
 
         if person is not None:
+            row['tracker_id'] = person.get('tracker_id')
+            bbox = person.get('bbox')
+            if bbox:
+                row['bbox_x1'] = bbox.get('x1')
+                row['bbox_y1'] = bbox.get('y1')
+                row['bbox_x2'] = bbox.get('x2')
+                row['bbox_y2'] = bbox.get('y2')
+                row['bbox_conf'] = bbox.get('conf')
+
             for kp, val in person.items():
-                if kp == 'tracker_id':
+                if kp in PERSON_METADATA_KEYS:
                     continue  # metadata key, not a keypoint
                 if val:
                     row[f'{kp}_x'] = val['x']

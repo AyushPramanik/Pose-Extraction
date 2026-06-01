@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import pandas as pd
+from matplotlib.patches import Patch
 
 from src.pose_extractor import KEYPOINT_NAMES, POSE_CONNECTIONS
 from src.utils.logger import get_logger
@@ -23,6 +24,15 @@ _TRACKER_COLORS = [
 
 _COLOR_GREY = (160, 160, 160)
 
+_MOVEMENT_COLORS = {
+    'still': '#c7c7c7',
+    'gesturing': '#d62728',
+    'nodding': '#1f77b4',
+    'head_shaking': '#ff7f0e',
+    'arm_bending': '#2ca02c',
+    'body_shift': '#9467bd',
+}
+
 
 def _person_color(tracker_id) -> tuple[int, int, int]:
     if tracker_id is None:
@@ -37,6 +47,21 @@ def annotate_frame(frame: np.ndarray, persons: list[dict], confidence: float = 0
     for person in persons:
         tracker_id = person.get('tracker_id')
         color = _person_color(tracker_id)
+        bbox = person.get('bbox')
+        if tracker_id is None and bbox and bbox.get('conf', 0.0) < 0.3:
+            continue
+
+        if bbox:
+            x1, y1 = int(bbox['x1']), int(bbox['y1'])
+            x2, y2 = int(bbox['x2']), int(bbox['y2'])
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            label = f"person {tracker_id}" if tracker_id is not None else "person"
+            label += f" {bbox.get('conf', 0):.2f}"
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            label_y = max(0, y1 - th - baseline - 4)
+            cv2.rectangle(out, (x1, label_y), (x1 + tw + 8, label_y + th + baseline + 6), color, -1)
+            cv2.putText(out, label, (x1 + 4, label_y + th + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
         # Skeleton connections
         for a_name, b_name in POSE_CONNECTIONS:
@@ -47,7 +72,7 @@ def annotate_frame(frame: np.ndarray, persons: list[dict], confidence: float = 0
 
         # Keypoint dots
         for name, kp in person.items():
-            if name == 'tracker_id' or not isinstance(kp, dict):
+            if name in ('tracker_id', 'bbox') or not isinstance(kp, dict):
                 continue
             if kp and kp['conf'] >= confidence:
                 is_extremity = name in ('left_wrist', 'right_wrist', 'nose')
@@ -90,6 +115,107 @@ def render_annotated_video(video_path: str, frames_data: list[dict], output_path
     cap.release()
     writer.release()
     _LOGGER.info(f"Annotated video -> {output_path}")
+
+
+def plot_all_person_movements(
+    movement_df: pd.DataFrame,
+    output_path: str,
+    title: str = "All-Person Movement Overview",
+) -> None:
+    """Render a combined movement graph for every tracked person."""
+    fig = plt.figure(figsize=(18, 12))
+    gs = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[2.3, 2.3, 1.5], hspace=0.42)
+
+    if movement_df.empty:
+        fig.text(0.5, 0.5, "No movement data available", ha='center', va='center', fontsize=14)
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        _LOGGER.info(f"All-person movement graph -> {output_path}")
+        return
+
+    df = movement_df.copy()
+    df['person_label'] = df['person_id'].apply(lambda x: f"person {int(x)}" if pd.notna(x) else "person")
+    person_ids = sorted(df['person_id'].dropna().unique(), key=lambda x: int(x))
+    labels = [f"person {int(pid)}" for pid in person_ids]
+    person_colors = dict(zip(person_ids, plt.cm.tab10(np.linspace(0, 1, max(len(person_ids), 1)))))
+
+    # Panel 1: energy over time
+    ax1 = fig.add_subplot(gs[0, 0])
+    for pid in person_ids:
+        part = df[df['person_id'] == pid].sort_values('mid_time')
+        ax1.plot(
+            part['mid_time'],
+            part['movement_energy'],
+            marker='o',
+            markersize=2.8,
+            linewidth=1.4,
+            color=person_colors[pid],
+            label=f"person {int(pid)}",
+            alpha=0.9,
+        )
+    ax1.set_title('Movement Energy Timeline')
+    ax1.set_ylabel('mean speed')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylim(bottom=0)
+    ax1.grid(True, axis='y', alpha=0.25)
+    ax1.legend(ncol=min(4, max(1, len(person_ids))), fontsize=8, loc='upper right')
+
+    # Panel 2: movement label timeline
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    for y, pid in enumerate(person_ids):
+        part = df[df['person_id'] == pid].sort_values('start_time')
+        for row in part.itertuples(index=False):
+            movement = str(row.primary_movement)
+            color = _MOVEMENT_COLORS.get(movement, '#8c8c8c')
+            ax2.broken_barh(
+                [(float(row.start_time), max(0.02, float(row.end_time) - float(row.start_time)))],
+                (y - 0.36, 0.72),
+                facecolors=color,
+                edgecolors='white',
+                linewidth=0.35,
+                alpha=0.88,
+            )
+    ax2.set_yticks(range(len(labels)))
+    ax2.set_yticklabels(labels)
+    ax2.set_title('Primary Movement Labels')
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylim(-0.7, len(labels) - 0.3 if labels else 0.7)
+    ax2.grid(True, axis='x', alpha=0.2)
+    used_movements = [m for m in _MOVEMENT_COLORS if m in set(df['primary_movement'].astype(str))]
+    ax2.legend(
+        handles=[Patch(facecolor=_MOVEMENT_COLORS[m], label=m) for m in used_movements],
+        ncol=min(4, max(1, len(used_movements))),
+        fontsize=8,
+        loc='upper right',
+    )
+
+    # Panel 3: aggregate activity by person
+    ax3 = fig.add_subplot(gs[2, 0])
+    summary = (
+        df.assign(active=df['primary_movement'] != 'still')
+          .groupby('person_id', as_index=False)
+          .agg(avg_energy=('movement_energy', 'mean'), active_fraction=('active', 'mean'))
+          .sort_values('person_id')
+    )
+    x = np.arange(len(summary))
+    bar_colors = [person_colors[pid] for pid in summary['person_id']]
+    ax3.bar(x, summary['avg_energy'], color=bar_colors, alpha=0.82)
+    ax3.set_xticks(x)
+    ax3.set_xticklabels([f"person {int(pid)}" for pid in summary['person_id']])
+    ax3.set_ylabel('avg movement energy')
+    ax3.set_title('Aggregate Activity')
+    ax3.grid(True, axis='y', alpha=0.25)
+
+    ax3b = ax3.twinx()
+    ax3b.plot(x, summary['active_fraction'], color='black', marker='D', linewidth=1.4, label='active fraction')
+    ax3b.set_ylabel('active fraction')
+    ax3b.set_ylim(0, 1)
+    ax3b.legend(fontsize=8, loc='upper right')
+
+    plt.suptitle(title, fontsize=15, fontweight='bold', y=0.98)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    _LOGGER.info(f"All-person movement graph -> {output_path}")
 
 
 # ==================== movement analysis plot ====================

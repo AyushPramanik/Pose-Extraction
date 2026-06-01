@@ -9,14 +9,21 @@ Outputs per tracked person (all written to --output-dir):
     <stem>_person<id>_keypoints_norm.csv   torso-normalised coordinates
     <stem>_person<id>_features.csv         frame-level kinematics
     <stem>_person<id>_summary.json         aggregate statistics
+    <stem>_person<id>_movement_log.csv     windowed movement labels
+    <stem>_person<id>_movement_log.txt     readable movement log
+    <stem>_person<id>_movement_summary.json aggregate movement labels
     <stem>_person<id>_movement_plot.png    6-panel visualisation
 
 Shared outputs (one per video):
     <stem>_poses.json          raw keypoints for all persons, all frames
-    <stem>_annotated.mp4       video with color-coded skeletons (--annotate-video)
+    <stem>_all_person_movement_log.csv combined movement log for all persons
+    <stem>_all_person_movements.png combined movement graph for all persons
+    <stem>_annotated.mp4       video with color-coded boxes/skeletons (--annotate-video)
 """
 import argparse, json
 from pathlib import Path
+
+import pandas as pd
 
 from src.pose_extractor import PoseExtractor
 from src.feature_extractor import (
@@ -26,7 +33,17 @@ from src.feature_extractor import (
     compute_features,
     compute_summary,
 )
-from src.visualizer import render_annotated_video, plot_movement_features
+from src.movement_recognizer import (
+    generate_movement_log,
+    summarize_movement_log,
+    write_text_log,
+    write_summary_json,
+)
+from src.visualizer import (
+    render_annotated_video,
+    plot_movement_features,
+    plot_all_person_movements,
+)
 from src.utils.logger import get_logger
 
 
@@ -40,7 +57,7 @@ class PoseExtractionPipeline():
 
     def parse_args(self) -> argparse.Namespace:
         parser = argparse.ArgumentParser(
-            description='Extract subtle movement features from video using YOLO-Pose + ByteTrack.',
+            description='Extract subtle movement features from video using YOLO-Pose + box tracking.',
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
         parser.add_argument('video', help='Path to input video file')                                           # 1st unnamed argument
@@ -61,7 +78,11 @@ class PoseExtractionPipeline():
                                 'Default: all detected persons.')
         parser.add_argument('--person-idx', type=int, default=0,
                             help='(Legacy) Array index when loading old pose JSON without tracker IDs.')
-        # ByteTrack tuning
+        parser.add_argument('--movement-window-seconds', type=float, default=1.0,
+                            help='Window size for per-person movement recognition logs.')
+        parser.add_argument('--movement-step-seconds', type=float, default=0.5,
+                            help='Step size between movement-recognition windows.')
+        # Tracker tuning
         parser.add_argument('--track-activation-threshold', type=float, default=0.3,
                             help='Min detection confidence to activate a new track.')
         parser.add_argument('--lost-track-buffer', type=int, default=60,
@@ -124,6 +145,8 @@ class PoseExtractionPipeline():
         _LOGGER.info(f"\nStart analysing {n} person(s): {ids_to_run if tracker_ids is not None else ['(index fallback)']}")
 
         all_summaries = {}
+        all_movement_summaries = {}
+        all_movement_logs = []
         for person_id in ids_to_run:
             label = f"person{person_id}" if person_id is not None else f"person_idx{self.args.person_idx}"
             prefix = f'{self.video_stem}_{label}'
@@ -150,6 +173,24 @@ class PoseExtractionPipeline():
                 json.dump(summary, f, indent=2)
             _LOGGER.info(f"        {feat_df.shape[1] - 3} feature columns computed")
 
+            # Movement labels
+            _LOGGER.info("Recognizing windowed movement labels...")
+            movement_log = generate_movement_log(
+                raw_df=raw_df,
+                norm_df=norm_df,
+                feat_df=feat_df,
+                fps=fps,
+                person_id=person_id,
+                window_seconds=self.args.movement_window_seconds,
+                step_seconds=self.args.movement_step_seconds,
+            )
+            movement_log.to_csv(self.output_path / f'{prefix}_movement_log.csv', index=False)
+            write_text_log(movement_log, self.output_path / f'{prefix}_movement_log.txt')
+            movement_summary = summarize_movement_log(movement_log)
+            write_summary_json(movement_summary, self.output_path / f'{prefix}_movement_summary.json')
+            _LOGGER.info(f"        {len(movement_log)} movement windows written")
+            all_movement_logs.append(movement_log)
+
             # [4/4] Plot
             _LOGGER.info("Generating movement plot...")
             plot_movement_features(
@@ -160,6 +201,20 @@ class PoseExtractionPipeline():
             )
 
             all_summaries[label] = summary
+            all_movement_summaries[label] = movement_summary
+
+        if all_movement_logs:
+            _LOGGER.info("Generating all-person movement graph...")
+            combined_movement = pd.concat(all_movement_logs, ignore_index=True)
+            combined_movement.to_csv(
+                self.output_path / f'{self.video_stem}_all_person_movement_log.csv',
+                index=False,
+            )
+            plot_all_person_movements(
+                combined_movement,
+                str(self.output_path / f'{self.video_stem}_all_person_movements.png'),
+                title=f"All-Person Movement Overview — {self.video_stem}",
+            )
 
         # ==================== annotated video (shared across all persons) ====================
         if self.args.annotate_video:
@@ -179,6 +234,10 @@ class PoseExtractionPipeline():
             for k in keys_to_show:
                 if k in summary:
                     _LOGGER.info(f"    {k:<36} {summary[k]:.5f}")
+            movement_summary = all_movement_summaries.get(label, {})
+            if movement_summary:
+                _LOGGER.info(f"    {'dominant_movement':<36} {movement_summary.get('dominant_movement')}")
+                _LOGGER.info(f"    {'active_fraction':<36} {movement_summary.get('active_fraction'):.3f}")
 
         _LOGGER.info(f"\nAll outputs in: {self.output_path}/")
 
