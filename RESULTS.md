@@ -1,8 +1,9 @@
 but # Interpreting Results
 
 This pipeline extracts subtle body movements from a video using YOLO-Pose
-(OpenPose-compatible 17-keypoint format).  Everything below applies to the
-files produced in `output/`.
+(OpenPose-compatible 17-keypoint format).  Current multi-person runs write one
+set of files per tracked person, for example
+`output/recording_individuals/recording_person2_movement_log.csv`.
 
 ---
 
@@ -15,8 +16,13 @@ files produced in `output/`.
 | `*_keypoints_norm.csv` | **Torso-normalised** coordinates — best file for analysis |
 | `*_features.csv` | Per-frame kinematics: speed, acceleration, range-of-motion, joint angles |
 | `*_summary.json` | Aggregate statistics across the whole clip |
+| `*_movement_log.csv` | Time-windowed movement labels for one tracked person |
+| `*_movement_log.txt` | Human-readable version of the movement log |
+| `*_movement_summary.json` | Aggregate movement-label fractions for one tracked person |
 | `*_movement_plot.png` | 6-panel visual summary |
-| `*_annotated.mp4` | Original video with pose skeleton overlaid |
+| `*_all_person_movement_log.csv` | Combined movement windows for every tracked person |
+| `*_all_person_movements.png` | Movement energy, label timeline, and aggregate activity graph for all people |
+| `*_annotated.mp4` | Original video with boxes, tracker IDs, and pose skeletons overlaid |
 
 ---
 

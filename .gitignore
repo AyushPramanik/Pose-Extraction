@@ -13,3 +13,7 @@ output/
 
 #model
 yolov8x-pose.pt
+
+#Mac
+.DS_Store
+**/.DS_Store
