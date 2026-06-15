@@ -42,15 +42,17 @@ POSE_CONNECTIONS = [
 class PoseExtractor:
     """YOLO-Pose wrapper with OpenPose-compatible output format."""
 
-    def __init__(self, checkpoint: str = 'yolov8x-pose.pt', confidence: float = 0.15):
+    def __init__(self, checkpoint: str = 'yolov8m-pose.pt', confidence: float = 0.15,
+                 imgsz: int = 640):
         self.confidence = confidence
-        print(f"Loading OpenPose model ({checkpoint})...")
+        self.imgsz = imgsz
+        print(f"Loading OpenPose model ({checkpoint}, imgsz={imgsz})...")
         self.model = YOLO(checkpoint)
         print("Model ready.")
 
     def process_frame(self, frame: np.ndarray) -> list[dict]:
         """Return a list of person dicts mapping keypoint name → {x, y, conf}."""
-        results = self.model(frame, verbose=False)
+        results = self.model(frame, verbose=False, imgsz=self.imgsz)
         persons: list[dict] = []
 
         for r in results:

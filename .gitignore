@@ -11,3 +11,6 @@ output/
 
 #model
 yolov8x-pose.pt
+
+#logs
+logs/

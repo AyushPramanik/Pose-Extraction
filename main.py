@@ -36,17 +36,22 @@ def main() -> None:
     parser.add_argument('video', help='Path to input video file')
     parser.add_argument('--output-dir', '-o', default='output',
                         help='Directory for all output files')
-    parser.add_argument('--checkpoint', '-c', default='yolov8x-pose.pt',
+    parser.add_argument('--checkpoint', '-c', default='yolov8m-pose.pt',
                         help='YOLO-Pose model. '
-                             'Higher accuracy: yolo11x-pose.pt. '
-                             'Faster: yolov8n-pose.pt.')
+                             'Higher accuracy (slower): yolov8x-pose.pt / yolo11x-pose.pt. '
+                             'Faster: yolov8s-pose.pt / yolov8n-pose.pt.')
     parser.add_argument('--confidence', type=float, default=0.15,
                         help='Keypoint detection threshold. '
                              'Lower catches subtler poses but adds noise.')
+    parser.add_argument('--imgsz', type=int, default=640,
+                        help='Inference resolution. Lower (e.g. 416) is faster '
+                             'with a small accuracy cost.')
     parser.add_argument('--person', type=int, default=0,
                         help='Person index when multiple people are detected.')
-    parser.add_argument('--skip-frames', type=int, default=0,
-                        help='Process every (N+1)th frame. 0 = every frame.')
+    parser.add_argument('--skip-frames', type=int, default=3,
+                        help='Process every (N+1)th frame. 0 = every frame. '
+                             'Default 3 (~8 fps) is ample for subtle low-frequency '
+                             'movement and ~4x faster than every frame.')
     parser.add_argument('--annotate-video', action='store_true',
                         help='Write a copy of the video with pose skeleton overlaid.')
     parser.add_argument('--classify', action='store_true',
@@ -69,7 +74,8 @@ def main() -> None:
     else:
         print(f"\n[1/4] Extracting poses from '{args.video}'...")
         poses_path = out / f'{stem}_poses.json'
-        extractor = PoseExtractor(checkpoint=args.checkpoint, confidence=args.confidence)
+        extractor = PoseExtractor(checkpoint=args.checkpoint, confidence=args.confidence,
+                                  imgsz=args.imgsz)
         frames, fps = extractor.extract_from_video(
             args.video,
             output_path=str(poses_path),
