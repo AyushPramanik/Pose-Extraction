@@ -73,9 +73,14 @@ class PoseExtractor:
         video_path: str,
         output_path: Optional[str] = None,
         skip_frames: int = 0,
+        target_fps: Optional[float] = None,
     ) -> tuple[list[dict], float]:
         """
         Extract pose keypoints from every (or every Nth) frame of a video.
+
+        If ``target_fps`` is given it takes precedence over ``skip_frames``:
+        the stride is derived from the source framerate so sampling lands at
+        roughly ``target_fps`` regardless of the video's native fps.
 
         Returns (frames_data, effective_fps).
         frames_data entries: {frame_idx, sample_idx, timestamp, persons}.
@@ -86,7 +91,10 @@ class PoseExtractor:
 
         source_fps: float = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total: int = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        stride = max(1, skip_frames + 1)
+        if target_fps and target_fps > 0:
+            stride = max(1, round(source_fps / target_fps))
+        else:
+            stride = max(1, skip_frames + 1)
         effective_fps = source_fps / stride
 
         frames: list[dict] = []

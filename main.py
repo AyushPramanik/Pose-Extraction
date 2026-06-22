@@ -48,10 +48,14 @@ def main() -> None:
                              'with a small accuracy cost.')
     parser.add_argument('--person', type=int, default=0,
                         help='Person index when multiple people are detected.')
+    parser.add_argument('--fps', type=float, default=1.0,
+                        help='Target sampling rate in frames per second. The stride '
+                             'is derived from the source framerate so sampling lands '
+                             'at roughly this rate regardless of native fps. '
+                             'Default 1.0. Set to 0 to use --skip-frames instead.')
     parser.add_argument('--skip-frames', type=int, default=3,
                         help='Process every (N+1)th frame. 0 = every frame. '
-                             'Default 3 (~8 fps) is ample for subtle low-frequency '
-                             'movement and ~4x faster than every frame.')
+                             'Only used when --fps is 0.')
     parser.add_argument('--annotate-video', action='store_true',
                         help='Write a copy of the video with pose skeleton overlaid.')
     parser.add_argument('--classify', action='store_true',
@@ -80,6 +84,7 @@ def main() -> None:
             args.video,
             output_path=str(poses_path),
             skip_frames=args.skip_frames,
+            target_fps=args.fps,
         )
         print(f"      {len(frames)} samples at {fps:.2f} fps → {poses_path.name}")
 
