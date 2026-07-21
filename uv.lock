@@ -2277,7 +2277,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "scipy", specifier = ">=1.11" },
-    { name = "supervision", specifier = ">=0.21" },
+    { name = "supervision", specifier = ">=0.21,<0.30" },
     { name = "ultralytics", specifier = ">=8.0" },
 ]
 

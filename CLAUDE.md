@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Pose-Extraction** is a pipeline for analyzing subtle body movements in seated subjects (e.g., listening to music) using YOLO-Pose, an OpenPose-compatible pose detection model. The system detects 17 keypoints per person, normalizes coordinates relative to the torso, and extracts kinematic features to quantify movement engagement.
+**Pose-Extraction** is a pipeline for detecting subtle body movement in seated subjects (e.g., listening to music) using YOLO-Pose, an OpenPose-compatible pose detection model. The system detects 17 keypoints per person, builds a PoseC3D-style subject-centered heatmap representation, and makes an unsupervised **move / no-move** decision per person over time.
 
-**Core insight:** Torso normalization removes confounds from camera distance and body position, making tiny relative movements detectable — enabling analysis of micro-expressions, rhythmic hand movements, and postural dynamics.
+**Core insight (from PoseC3D / the MiGA micro-gesture paper):** a subject-centered crop + resize removes camera-distance and framing confounds; motion is then measured as the temporal variance of keypoints in that normalized crop, making tiny relative movements detectable. The same keypoints are exported in PYSKL format so a PoseC3D CNN can later be trained on the identical data (gesture classification) without re-extraction.
 
 ---
 
@@ -31,41 +31,36 @@ The pipeline flows through four stages, each handled by a dedicated module:
   - `yolov8x-pose` → best for subtle movement (default)
   - `yolo11x-pose` → latest architecture, highest accuracy
 
-### 2. **Data Normalization & Kinematics** (`feature_extractor.py`)
-- **Torso normalization:** Expresses every keypoint relative to shoulder midpoint, scaled by shoulder width. This removes global translation so relative movements become visible.
-  - Reference point: midpoint between left and right shoulders = (0, 0)
-  - Scale: shoulder width in pixels
-  - Result: coordinates in "shoulder-width units", enabling cross-person comparison
-- **Keypoint grouping:** HEAD, SHOULDERS, ARMS, TORSO subsets used in different computations
-- **Feature computation:**
-  - Speed: √(vx² + vy²) in shoulder-widths/second
-  - Acceleration: rate of change of speed
-  - Range of motion (ROM): min–max over 1-second window
-  - Joint angles: elbow angles in degrees (via 3-point geometry)
-- **Smoothing:** Savitzky–Golay filter on linearly interpolated signals to denoise
-- **Frequency analysis:** FFT-based dominant frequency detection for each keypoint (Hz)
+### 2. **PoseC3D Representation** (`heatmap_volume.py`)
+Pure representation layer following the PYSKL PoseC3D data-prep pipeline
+(`build → pose_compact → uniform_sample → resize → generate`):
+- **Subject-centered crop (`pose_compact`):** union bbox over all keypoints across all frames, expanded and forced square — removes camera-distance/framing confounds (the modern replacement for the old torso normalization).
+- **Uniform sampling:** deterministic `T`-frame sampling (default 48) from variable-length clips.
+- **Gaussian heatmap volumes:** joint modality `(K, T, H, W)` and limb modality `(E, T, H, W)`, σ=0.6 on a 56×56 grid, confidence-scaled. Used for Signal B and future CNN input.
+- **PYSKL export (`to_pyskl_annotation`):** raw-pixel keypoints + `img_shape` in the exact dict format a PoseC3D CNN consumes (`keypoint (M,T,K,2)`, `keypoint_score (M,T,K)`, `label` placeholder 0).
 
-### 3. **Visualization** (`visualizer.py`)
-- **Annotated video:** Overlays bounding boxes, tracker IDs, pose skeletons, and keypoint markers on original video
-- **Movement plot:** 6-panel figure showing:
-  1. Head movement speed (nose, ears)
-  2. Arm movement speed (wrists, elbows)
-  3. Vertical range of motion
-  4. Elbow angles
-  5. Overall body movement energy (area fill)
-  6. Per-keypoint mean speed bar chart
+### 3. **Unsupervised Move / No-Move** (`motion_detector.py`)
+- **Signal A (primary):** slides a time window over crop-normalized keypoints; per window `motion_energy = Σ_k [Var(x_k) + Var(y_k)]`, confidence-weighted. Scale/framing invariant by construction.
+- **Decision:** **absolute** noise-calibrated threshold on `energy_a` (crop-normalized keypoint variance) — `is_moving = energy_a > move_threshold`, the same for every person. Answers "did this person move", not "did they move more than their own normal".
+- **Signal B (optional, `--signal-b`):** L1 temporal difference of consecutive rendered joint heatmaps, mean over T — corroborates Signal A per person.
+- Emits a per-window DataFrame (the `_motion_log.csv` schema) that drives clip splitting and plots.
 
-### 4. **Pipeline Orchestration** (`run_detection.py`)
-- CLI entry point; chains the above stages
-- Optionally loads pre-computed poses (`--load-poses`) to skip re-detection
-- Outputs 7 files per input video:
+### 4. **Visualization** (`visualizer.py`)
+- **Annotated video / per-person clips:** bounding boxes, tracker IDs, pose skeletons on the original video (unchanged).
+- **Motion plots:** per-person 2-panel (motion-energy timeline + threshold; move/still band) and all-person 3-panel overview (energy lines, move/still bands per person, aggregate bar).
+
+### 5. **Pipeline Orchestration** (`run_detection.py`)
+- CLI entry point; chains the above stages; per-person analysis fanned out across worker processes.
+- Optionally loads pre-computed poses (`--load-poses`) to skip re-detection.
+- Outputs per input video:
   - `*_poses.json` → raw keypoints per frame
-  - `*_keypoints.csv` → flat CSV of raw coordinates
-  - `*_keypoints_norm.csv` → torso-normalized coordinates (use these for analysis)
-  - `*_features.csv` → frame-level kinematics
-  - `*_summary.json` → aggregate statistics
-  - `*_movement_plot.png` → 6-panel visualization
-  - `*_annotated.mp4` → video with overlay (optional)
+  - `*_pyskl.pkl` → CNN-ready PYSKL annotations (all persons)
+  - `*_person<N>_motion_log.csv` / `.txt` → per-window move/no-move log
+  - `*_person<N>_motion_summary.json` → per-person aggregate stats
+  - `*_person<N>_motion_plot.png` → per-person motion plot
+  - `*_all_person_motion_log.csv` / `*_all_person_motions.png` → combined
+  - `*_annotated.mp4` → video with overlay (optional, `--annotate-video`)
+  - `*_clips_index.csv` + bout clips → optional (`--split-clips`)
 
 ---
 
@@ -101,12 +96,17 @@ python -m src.run_detection recording.mov --skip-frames 1
 python -m src.run_detection recording.mov --annotate-video
 ```
 
-### Recompute features without re-running detection
+### Recompute motion without re-running detection
 ```bash
-python -m src.run_detection recording.mov --load-poses output/recording_poses.json
+python -m src.run_detection recording.mov --load-poses output/videos/recording_poses.json
 ```
 
-### Extract from a different person in multi-person video
+### Add heatmap corroboration (Signal B) and per-bout clips
+```bash
+python -m src.run_detection recording.mov --signal-b --split-clips
+```
+
+### Analyse a specific person in a multi-person video
 ```bash
 python -m src.run_detection recording.mov --person-ids 1
 ```
@@ -115,41 +115,26 @@ python -m src.run_detection recording.mov --person-ids 1
 
 ## Data Flow & Key Concepts
 
-### Coordinate systems
+### Crop space & heatmap grid
+- Keypoints are detected in **pixel space**, then `pose_compact` shifts them into a **subject-centered square crop** and `resize_keypoints` scales that crop to a **56×56 grid**. This crop/resize is what makes motion scale- and framing-invariant (replaces the old shoulder-width normalization).
+- **Joint modality:** one Gaussian channel per keypoint → `(17, T, 56, 56)`.
+- **Limb modality:** one segment-Gaussian channel per skeleton edge → `(16, T, 56, 56)`.
 
-**Raw pixel space (`*_keypoints.csv`):**
-- (x, y) in pixels, as detected by the model
-- Dependent on camera distance, framing, person size
+### Per-window motion log (`*_motion_log.csv`)
+One row per sliding window per person:
+- **motion_energy:** Σ over keypoints of crop-normalized temporal variance (Signal A).
+- **active_threshold:** the absolute move/still floor used (constant across all people; `--move-threshold`, default 1e-4).
+- **is_moving / state:** the move/no-move decision (`is_moving == energy_a > active_threshold`). Note the decision is on `energy_a`, not the fused `motion_energy` (which is a per-person-normalized display magnitude).
+- **mean_keypoint_conf / n_valid_kp:** detection quality inside the window.
+- With `--signal-b`: **heatmap_l1_mean** (per-person) + **ab_agreement** flag.
 
-**Torso-normalized space (`*_keypoints_norm.csv`):**
-- (x, y) in shoulder-width units relative to shoulder midpoint
-- Invariant to camera distance and body size
-- **This is the input for feature extraction** — it's what makes subtle movement analysis possible
-- Example: nose at (0.04, -0.50) = 4% of a shoulder-width to the right, 0.5 shoulder-widths above the shoulders
+### Summary statistics (`*_motion_summary.json`)
+- **moving_fraction:** fraction of windows labelled moving.
+- **mean_motion_energy / peak_motion_energy:** scalar motion level.
+- **active_threshold, n_windows, total_duration_s.**
 
-### Frame-level features (`*_features.csv`)
-
-For each keypoint:
-- **speed:** magnitude of velocity (shoulder-widths/second)
-- **accel:** magnitude of acceleration (shoulder-widths/second²)
-- **rom_x / rom_y:** range of motion over a 1-second rolling window
-
-Joint angles:
-- **left_elbow_angle / right_elbow_angle:** degrees (180° = fully extended, 90° = right angle)
-
-### Summary statistics (`*_summary.json`)
-
-Per-keypoint aggregates:
-- **mean_speed:** average velocity
-- **p95_speed:** 95th percentile (robust to outliers)
-- **active_fraction:** fraction of frames with speed > 1.5 units/s
-- **dominant_freq_hz:** strongest periodic component (Hz)
-
-Head & shoulder composites:
-- **head_lateral_freq_hz / head_vertical_freq_hz:** Fourier frequency of nose oscillation
-- **head_lateral_std / head_vertical_std:** postural stability (std of normalized position)
-- **shoulder_sway_freq_hz / shoulder_sway_std:** shoulder midpoint dynamics
-- **total_movement_energy:** mean speed across all upper-body keypoints (scalar engagement score)
+### CNN-ready annotations (`*_pyskl.pkl`)
+List of per-person PYSKL dicts (`frame_dir`, `label`=0 placeholder, `img_shape`, `total_frames`, `keypoint (1,T,17,2)`, `keypoint_score (1,T,17)`) — the input a PoseC3D CNN trains on directly, unchanged.
 
 ---
 
@@ -164,12 +149,12 @@ Head & shoulder composites:
 ### Poor pose tracking (jittery output)
 - Increase `--confidence` to filter weak detections
 - Annotated video (`--annotate-video`) reveals skeleton quality
-- Check `*_movement_plot.png` for spikes; sharp peaks often indicate false detections
+- Check `*_motion_plot.png` for spikes; sharp peaks often indicate false detections
 
-### Features look noisy
-- The Savitzky–Goyal smoothing window is hardcoded at 7 frames
-- For very low fps videos, consider `--skip-frames` or higher fps source
-- Torso normalization requires stable shoulder detection — poor shoulder tracking degrades all downstream features
+### Motion looks noisy or everything reads as "moving"
+- The decision is an absolute threshold on `energy_a`. If a still person reads as moving, raise `--move-threshold`; if real subtle motion is missed, lower it.
+- Run with `--signal-b`: if `ab_agreement` is False (Signal A says moving but heatmap L1 ≈ 0), the subject-centered crop is likely degenerate (too few valid keypoints).
+- For very low fps videos, lower `--skip-frames` so windows contain ≥2 samples.
 
 ### Memory issues
 - Use `--skip-frames` to process fewer frames
@@ -182,9 +167,11 @@ Head & shoulder composites:
 
 | File | Purpose |
 |------|---------|
-| `pose_extractor.py` | YOLO-Pose wrapper; keypoint detection from video |
-| `feature_extractor.py` | Torso normalization, kinematics, FFT, aggregate stats |
-| `visualizer.py` | Annotated video rendering and 6-panel plot |
+| `utils/pose_extractor.py` | YOLO-Pose + ByteTrack; keypoint detection from video |
+| `heatmap_volume.py` | PoseC3D representation: crop, sampling, Gaussian volumes, PYSKL export |
+| `motion_detector.py` | Windowed move/no-move (Signal A/B), per-window log, summaries |
+| `video_splitter.py` | Per-person movement-bout clip splitting |
+| `visualizer.py` | Annotated video rendering and motion plots |
 | `run_detection.py` | CLI orchestrator; chains all stages |
 | `RESULTS.md` | Format guide for all outputs (output file schemas) |
 | `pyproject.toml` | Dependencies: ultralytics, opencv, numpy, pandas, scipy, matplotlib |
@@ -196,8 +183,8 @@ Head & shoulder composites:
 Managed via `uv` (see `pyproject.toml`). Key packages:
 - **ultralytics** — YOLO-Pose model
 - **opencv-contrib-python** — video I/O and frame annotation
-- **numpy, pandas** — data manipulation
-- **scipy** — signal processing (Savitzky–Golay, FFT)
+- **numpy, pandas** — data manipulation, Gaussian rendering, windowed stats
+- **supervision** — ByteTrack multi-person tracking
 - **matplotlib** — plotting
 - **pillow** — image utilities
 
@@ -215,15 +202,18 @@ Managed via `uv` (see `pyproject.toml`). Key packages:
 - **For production:** `yolov8x-pose` (balanced)
 - **For speed:** `yolov8n-pose` (fastest, lowest accuracy)
 
-### Torso normalization invariants
-- Shoulder midpoint is always (0, 0) in normalized space — `shoulder_sway_std` always 0.0
-- Use `left_shoulder_speed` / `right_shoulder_speed` from `*_features.csv` to measure shoulder sway instead
-- Missing shoulder detections degrade all downstream coordinates (interpolation is best-effort)
+### Move/no-move decision
+- The decision is **absolute** (`energy_a > --move-threshold`), the same scale for every person — it answers whether a person moved, not whether they moved more than their own baseline.
+- `motion_energy` is unitless (variance of normalized crop coordinates); compare it only within a person, or via `moving_fraction` across persons.
+- Signal A needs only cropped keypoints (cheap, per window); Signal B renders the heatmap volume (heavier, per person) and is opt-in via `--signal-b`.
+
+### Future CNN training
+- `*_pyskl.pkl` is written in the PYSKL annotation format. To train a PoseC3D classifier later, add real `label` values and feed the pickle to PYSKL/mmaction2 — no re-extraction needed.
 
 ### Output size
 - `*_poses.json` is compact (raw keypoints only)
-- `*_keypoints.csv` / `*_keypoints_norm.csv` are row-per-frame tables
-- `*_features.csv` is same row count, wider (4–5 columns per keypoint)
+- `*_motion_log.csv` is one row per sliding window per person
+- `*_pyskl.pkl` stores full-length keypoint arrays (compact)
 - `*_annotated.mp4` is largest; same size as input video
 
 ---

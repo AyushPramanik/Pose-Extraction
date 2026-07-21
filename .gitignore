@@ -6,13 +6,13 @@ logs/
 .claude/
 
 # Virtual environments
-.venv
+**/*venv*
 
 #output
 output/
 
 #model
-yolov8x-pose.pt
+yolo*
 
 #Mac
 .DS_Store

@@ -1,161 +1,179 @@
-but # Interpreting Results
+# Interpreting Results
 
-This pipeline extracts subtle body movements from a video using YOLO-Pose
-(OpenPose-compatible 17-keypoint format).  Current multi-person runs write one
-set of files per tracked person, for example
-`output/recording_individuals/recording_person2_movement_log.csv`.
+This pipeline detects subtle body movement from a video using YOLO-Pose
+(OpenPose-compatible 17-keypoint format), builds a PoseC3D-style
+subject-centered heatmap representation, and makes an unsupervised
+**move / no-move** decision per tracked person over time.  Multi-person runs
+write one set of files per tracked person, e.g.
+`output/statistics/recording_person2_motion_log.csv`.
+
+Outputs are split across two folders inside `--output-dir`:
+
+- `statistics/` — CSV / JSON tables and plots
+- `videos/` — the poses JSON, the CNN-ready annotations, the annotated video, and split clips
 
 ---
 
 ## Output files
 
+### `statistics/`
+
 | File | What it contains |
 |------|-----------------|
-| `*_poses.json` | Raw keypoint detections per frame (pixel coordinates + confidence) |
-| `*_keypoints.csv` | Same data as the JSON, in a flat table |
-| `*_keypoints_norm.csv` | **Torso-normalised** coordinates — best file for analysis |
-| `*_features.csv` | Per-frame kinematics: speed, acceleration, range-of-motion, joint angles |
-| `*_summary.json` | Aggregate statistics across the whole clip |
-| `*_movement_log.csv` | Time-windowed movement labels for one tracked person |
-| `*_movement_log.txt` | Human-readable version of the movement log |
-| `*_movement_summary.json` | Aggregate movement-label fractions for one tracked person |
-| `*_movement_plot.png` | 6-panel visual summary |
-| `*_all_person_movement_log.csv` | Combined movement windows for every tracked person |
-| `*_all_person_movements.png` | Movement energy, label timeline, and aggregate activity graph for all people |
-| `*_annotated.mp4` | Original video with boxes, tracker IDs, and pose skeletons overlaid |
+| `*_person<ID>_motion_log.csv` | Per-window move/no-move log for one tracked person |
+| `*_person<ID>_motion_log.txt` | Human-readable version of the motion log |
+| `*_person<ID>_motion_summary.json` | Aggregate motion statistics for one person |
+| `*_person<ID>_motion_plot.png` | 2-panel motion plot (energy timeline + move/still band) |
+| `*_all_person_motion_log.csv` | Combined motion windows for every tracked person |
+| `*_all_person_motions.png` | Energy timelines, move/still bands, and aggregate activity for all people |
+
+### `videos/`
+
+| File | What it contains |
+|------|-----------------|
+| `*_poses.json` | Raw keypoint detections per frame (pixel coordinates + confidence) for all people |
+| `*_pyskl.pkl` | CNN-ready PYSKL annotations for all people (see below) |
+| `*_annotated.mp4` | Original video with boxes, tracker IDs, and pose skeletons overlaid (`--annotate-video`) |
+| `*_person<ID>_bout<N>_<state>_<start>-<end>s.mp4` | One clip per movement bout per person (`--split-clips`) |
+| `*_clips_index.csv` | Index of every split clip: person, state, times, frames, energy, file |
 
 ---
 
-## Coordinate system (`*_keypoints_norm.csv`)
+## Crop space & heatmap grid
 
-All `_x` and `_y` columns are expressed in **shoulder-width units**, relative
-to the midpoint between the two shoulders.
+Keypoints are detected in **pixel space**, then re-expressed for analysis:
 
-```
-         ← negative x         positive x →
-                    [shoulder midpoint = (0, 0)]
-         ↑ negative y (up on screen)
-         ↓ positive  y (down on screen)
-```
+1. **Subject-centered crop** (`pose_compact`): a single square box is fitted
+   around all of a person's keypoints across all frames, expanded by padding.
+2. **Resize**: the crop is scaled to a fixed **56×56 grid**.
 
-A nose value of `(0.04, -0.50)` means the nose is 4% of a shoulder-width to
-the right of centre and half a shoulder-width above the shoulders.
+This crop + resize removes camera-distance and framing confounds, so
+coordinates change *only* when body parts move relative to the body — which is
+what makes subtle movement detectable.  (This replaces the older
+shoulder-width torso normalization.)
 
-**Why normalise?**  A person who leans forward slightly or sits at a different
-distance will produce different raw pixel values even if they made no relative
-movement.  Normalised coordinates remove that confound, so values change *only*
-when body parts move relative to the torso.  This is what makes subtle
-movements detectable.
+Two Gaussian heatmap modalities can be rendered on the grid:
 
-> **Note:** Because the shoulder midpoint is defined as `(0, 0)`,
-> `shoulder_sway_std` in the summary will always be `0.0` — that is expected,
-> not a bug.  To measure shoulder sway use `left_shoulder_speed` or
-> `right_shoulder_speed` from `*_features.csv` instead.
+- **Joint modality** — one channel per keypoint → `(17, T, 56, 56)`
+- **Limb modality** — one channel per skeleton edge → `(16, T, 56, 56)`
+
+The joint volume is used for Signal B; both are the representation a PoseC3D
+CNN would consume after training data is labeled.
 
 ---
 
-## Feature columns (`*_features.csv`)
+## Per-window motion log (`*_motion_log.csv`)
 
-Each keypoint produces four columns.  Example for `nose`:
+One row per sliding window (default 1.0 s window, 0.5 s step) per person.
 
-| Column | Meaning | Unit |
-|--------|---------|------|
-| `nose_speed` | Magnitude of velocity (√vx²+vy²) | shoulder-widths / second |
-| `nose_accel` | Rate of change of speed | shoulder-widths / second² |
-| `nose_rom_x` | Horizontal range of motion over the last 1 s | shoulder-widths |
-| `nose_rom_y` | Vertical range of motion over the last 1 s | shoulder-widths |
+| Column | Meaning |
+|--------|---------|
+| `person_id` | Tracker ID |
+| `start_time` / `end_time` / `mid_time` | Window bounds and midpoint (seconds) |
+| `start_frame` / `end_frame` | Source frame-index bounds |
+| `energy_a` | **Decision signal.** Σ over keypoints of crop-normalized temporal variance (Signal A). Comparable across people. |
+| `motion_energy` | Fused display magnitude (keypoint+joint+limb, per-person normalized). Not the decision variable. |
+| `active_threshold` | The absolute move/still floor used — the **same constant for every person** (`--move-threshold`, default 1e-4). |
+| `is_moving` | `True` when `energy_a > active_threshold` **and** `mean_keypoint_conf >= 0.8` (a low-confidence/occluded window is forced `still`, since its variance is detector jitter, not movement) |
+| `state` | `moving` / `still` |
+| `mean_keypoint_conf` | Mean confidence of valid keypoints in the window |
+| `n_valid_kp` | Number of keypoints that contributed |
+| `energy_head` / `energy_arms` / `energy_torso` / `energy_legs` / `dominant_region` | Per-body-part diagnostics (do not affect the decision) |
 
-`left_elbow_angle` / `right_elbow_angle` give the angle at the elbow joint in
-degrees (180° = arm fully extended, 90° = right angle).
+With `--signal-b`, two more columns are added (constant per person):
 
-The first row will be NaN for speed/acceleration — that is normal; a
-first-difference needs at least two frames.
+| Column | Meaning |
+|--------|---------|
+| `heatmap_l1_mean` | Mean L1 difference between consecutive rendered joint heatmaps (Signal B) |
+| `ab_agreement` | `False` when Signal A reports motion but Signal B ≈ 0 (hint of a degenerate crop) |
+
+> The move/still decision is **absolute**: `energy_a > move_threshold`, the same
+> threshold for everyone. It answers "did this person move", not "did they move
+> more than their own normal". `energy_a` is comparable across people; the fused
+> `motion_energy` is a per-person-normalized display magnitude only.
 
 ---
 
-## Summary statistics (`*_summary.json`)
-
-### Per-keypoint fields
+## Summary statistics (`*_motion_summary.json`)
 
 ```
-{keypoint}_mean_speed      Average speed across the clip.
-{keypoint}_p95_speed       95th-percentile speed — the magnitude of the
-                           largest bursts without being thrown off by
-                           individual outlier frames.
-{keypoint}_active_fraction Fraction of frames where speed > 1.5 units/s.
-                           With normalised coordinates typical subtle
-                           movements sit well below this threshold, so this
-                           will often read 0.0.  It is most useful for
-                           comparing one person against another or one clip
-                           against another rather than as an absolute measure.
-{keypoint}_dominant_freq_hz Frequency (Hz) of the strongest periodic pattern
-                           in that keypoint's lateral position signal.
-```
-
-### Head and shoulder summary fields
-
-```
-head_lateral_freq_hz   Dominant horizontal oscillation frequency of the nose.
-head_vertical_freq_hz  Dominant vertical oscillation frequency of the nose.
-head_lateral_std       Standard deviation of horizontal head position.
-                       Larger = more lateral head movement across the clip.
-head_vertical_std      Standard deviation of vertical head position.
-                       Larger = more nodding / bobbing.
-shoulder_sway_freq_hz  Dominant frequency in the shoulder midpoint lateral
-                       position (note: std is always 0 — see above).
-total_movement_energy  Mean speed averaged over all upper-body keypoints and
-                       all frames.  Single summary number for how much the
-                       person moved overall.
+moving_fraction      Fraction of windows labelled "moving".
+mean_motion_energy   Average motion_energy across all windows.
+peak_motion_energy   Largest single-window motion_energy.
+active_threshold     The absolute move/still threshold used (same for everyone).
+n_windows            Number of sliding windows evaluated.
+total_duration_s     Time span covered by the windows.
 ```
 
 ---
 
-## Reading the movement plot (`*_movement_plot.png`)
+## CNN-ready annotations (`*_pyskl.pkl`)
+
+A pickled list of per-person dicts in the PYSKL/PoseC3D annotation format:
+
+| Key | Shape / type | Meaning |
+|-----|--------------|---------|
+| `frame_dir` | str | Unique clip id (`<stem>_person<ID>`) |
+| `label` | int | Class id — placeholder `0` in the unsupervised setting |
+| `img_shape` / `original_shape` | `(H, W)` | Original frame size (best-effort) |
+| `total_frames` | int | Number of frames the person appears in |
+| `keypoint` | `(1, T, 17, 2)` float32 | Raw **pixel** keypoints (M = 1 person) |
+| `keypoint_score` | `(1, T, 17)` float32 | Per-joint confidence |
+
+To train a PoseC3D classifier later: assign real `label` values and feed the
+pickle to PYSKL/mmaction2.  The pipeline re-renders the crop/heatmap volume at
+train time, so no re-extraction is needed.
+
+---
+
+## Reading the motion plot
+
+**Per-person (`*_person<ID>_motion_plot.png`)**
 
 | Panel | What to look for |
 |-------|-----------------|
-| **Head Movement Speed** | Spikes = moments of clear head movement (nods, turns). A flat line near zero means the head was very still. |
-| **Arm Movement Speed** | Wrist spikes correlate with hand gestures or rhythmic tapping. Compare left vs right to see asymmetric engagement. |
-| **Vertical Range of Motion** | Sustained elevation = the body part held a different position for ≥1 s.  Sharp rise then fall = a brief gesture. |
-| **Elbow Angle** | Drift upward = arms raising.  Oscillation = repeated arm movement.  A flat line means arms stayed in one position. |
-| **Overall Body Movement Energy** | Filled area shows the total activity level over time.  Peaks are moments of higher engagement; valleys are stillness. |
-| **Mean Speed per Keypoint** | Bar chart comparing which body part moved the most on average.  Taller bars = more active region. |
+| **Motion Energy** | Filled area = motion level over time; the dashed red line is the person's move/still threshold; green dots mark windows labelled *moving*. |
+| **Move / Still** | Green band = moving, grey = still, across the timeline. |
+
+**All-person (`*_all_person_motions.png`)**
+
+| Panel | What to look for |
+|-------|-----------------|
+| **Motion Energy Timeline** | One line per person; compare who moved when. |
+| **Move / Still** | One row per person; green segments are their moving windows. |
+| **Aggregate Activity** | Bars = mean motion energy per person; the black diamond line = moving fraction. |
 
 ---
 
 ## Interpreting `recording.mov` results
 
-The clip is 628 frames at ~31.8 fps (≈ 19.7 seconds).
+The clip is 628 frames (≈ 19.7 s); with the default `--skip-frames 10` it is
+sampled to ~58 frames at ~2.9 fps, giving 39 windows per person.
 
-| Metric | Value | Interpretation |
-|--------|-------|----------------|
-| `total_movement_energy` | 0.019 | Low overall movement — consistent with calm, seated listening |
-| `head_lateral_std` | 0.012 | Nose moved ±1.2% of shoulder-width laterally — very subtle |
-| `head_vertical_std` | 0.006 | Less vertical than lateral — slight side-to-side presence |
-| `head_lateral_freq_hz` | 0.051 Hz | One full sway cycle every ~20 s — very slow postural drift, not rhythmic tapping |
-| `left_wrist_dominant_freq_hz` | 0.354 Hz | One cycle every ~2.8 s — the most rhythmically active point; worth inspecting in the annotated video |
-| `right_wrist_dominant_freq_hz` | 0.202 Hz | One cycle every ~5 s — slower right-hand rhythm |
-| `left_elbow_dominant_freq_hz` | 0.304 Hz | Matches left wrist, suggesting coupled arm movement |
-| `shoulder_sway_std` | 0.000 | Expected (see note above) |
+| Person | moving_fraction | mean_motion_energy | peak_motion_energy | Interpretation |
+|--------|-----------------|--------------------|--------------------|----------------|
+| person4 | 0.128 | 4.1e-4 | 3.0e-3 | Most active of the stable tracks — a clip is cut around 12.5–15.5 s |
+| person2 | 0.154 | 2.2e-4 | 1.2e-3 | Notable early movement — clip cut around 0–2.5 s |
+| person3 | 0.077 | 2.1e-4 | 1.6e-3 | Occasional movement |
+| person1 / person5 / person6 | ~0.05 | ~1e-4 | <1e-3 | Mostly still — calm seated listening |
+| person7 | 0.25 | 6.2e-3 | 2.3e-2 | Short 4-window track (≈2 s); high energy but low sample count — likely a transient/pass-through detection |
 
-**What to investigate next:**
-- Open `recording_annotated.mp4` and watch around the moments where the arm
-  movement plot shows peaks — these are the highest-engagement instants.
-- The left wrist (0.35 Hz) moves more rhythmically than the right (0.20 Hz);
-  this asymmetry may reflect which hand is resting vs. active.
-- The 0.051 Hz head frequency is too slow to be beat-tracking (music is
-  typically 1–3 Hz).  A longer clip will reveal whether faster rhythmic
-  components emerge.
+**Notes:**
+- Most stable tracks read as mostly *still*, consistent with calm seated
+  listening; person2 and person4 have the clearest movement bouts and are the
+  ones `--split-clips` cuts.
+- Short tracks (person7) can show high `motion_energy` from just a few frames —
+  weight them by `n_windows` / track duration before trusting them.
 
 ---
 
 ## Tips for comparing across participants or clips
 
-- Use `total_movement_energy` as the headline engagement score.
-- Use `head_vertical_std` and `head_lateral_std` for postural stability.
-- Use `left_wrist_dominant_freq_hz` / `right_wrist_dominant_freq_hz` for
-  rhythmic hand activity.
-- All values are normalised so they are comparable across people of different
-  sizes and at different camera distances.
-- Run with `--load-poses output/recording_poses.json` to re-compute features
-  without re-running the pose detector.
+- Use `moving_fraction` as the headline "how much did this person move" score —
+  it is normalized and comparable across people.
+- Compare `motion_energy` **within** a person over time, not across people
+  (the threshold is per person).
+- Run with `--signal-b` to corroborate the decision with the heatmap volume;
+  check `ab_agreement`.
+- Run with `--load-poses output/videos/recording_poses.json` to re-compute
+  motion without re-running the pose detector.

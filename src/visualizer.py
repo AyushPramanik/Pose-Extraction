@@ -5,7 +5,7 @@ import matplotlib.gridspec as gridspec
 import pandas as pd
 from matplotlib.patches import Patch
 
-from src.pose_extractor import KEYPOINT_NAMES, POSE_CONNECTIONS
+from src.utils.pose_extractor import POSE_CONNECTIONS
 from src.utils.logger import get_logger
 
 
@@ -24,13 +24,9 @@ _TRACKER_COLORS = [
 
 _COLOR_GREY = (160, 160, 160)
 
-_MOVEMENT_COLORS = {
+_STATE_COLORS = {
+    'moving': '#2ca02c',
     'still': '#c7c7c7',
-    'gesturing': '#d62728',
-    'nodding': '#1f77b4',
-    'head_shaking': '#ff7f0e',
-    'arm_bending': '#2ca02c',
-    'body_shift': '#9467bd',
 }
 
 
@@ -117,84 +113,203 @@ def render_annotated_video(video_path: str, frames_data: list[dict], output_path
     _LOGGER.info(f"Annotated video -> {output_path}")
 
 
-def plot_all_person_movements(
-    movement_df: pd.DataFrame,
+def render_person_clip(
+    video_path: str,
+    frames_data: list[dict],
     output_path: str,
-    title: str = "All-Person Movement Overview",
+    person_id: int,
+    start_frame: int,
+    end_frame: int,
 ) -> None:
-    """Render a combined movement graph for every tracked person."""
+    """
+    Write a clip covering [start_frame, end_frame] of the source video, with the
+    box + skeleton overlay drawn for one person only (the full frame is kept).
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    # Persons for the target id only, keyed by frame index.
+    frame_map = {
+        f['frame_idx']: [p for p in f['persons'] if p.get('tracker_id') == person_id]
+        for f in frames_data
+    }
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    idx = start_frame
+    while cap.isOpened() and idx <= end_frame:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        annotated = annotate_frame(frame, frame_map.get(idx, []))
+        writer.write(annotated)
+        idx += 1
+
+    cap.release()
+    writer.release()
+    _LOGGER.info(f"Clip -> {output_path}")
+
+
+def _state_bands(ax, part: pd.DataFrame, y: float, height: float) -> None:
+    """Draw move/still broken_barh bands for one person's sorted windows."""
+    for row in part.itertuples(index=False):
+        color = _STATE_COLORS.get(str(row.state), '#8c8c8c')
+        ax.broken_barh(
+            [(float(row.start_time), max(0.02, float(row.end_time) - float(row.start_time)))],
+            (y - height / 2, height),
+            facecolors=color,
+            edgecolors='white',
+            linewidth=0.35,
+            alpha=0.9,
+        )
+
+
+def plot_person_motion(
+    motion_df: pd.DataFrame,
+    output_path: str,
+    title: str = "Motion Analysis",
+) -> None:
+    """
+    Per-person motion plot:
+      1. motion_energy over time with the adaptive threshold and moving windows.
+      2. move/still band across time.
+      3. per-body-part energy (only when region columns are present).
+    """
+    region_cols = [c for c in motion_df.columns
+                   if c.startswith('energy_') and c not in
+                   ('energy_a', 'energy_joint', 'energy_limb', 'energy_flow')]
+    has_regions = len(region_cols) > 0
+
+    if has_regions:
+        fig = plt.figure(figsize=(14, 10))
+        gs = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[3, 1, 2], hspace=0.4)
+    else:
+        fig = plt.figure(figsize=(14, 8))
+        gs = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[3, 1], hspace=0.35)
+
+    if motion_df.empty:
+        fig.text(0.5, 0.5, "No motion data available", ha='center', va='center', fontsize=14)
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        _LOGGER.info(f"Motion plot -> {output_path}")
+        return
+
+    df = motion_df.sort_values('mid_time')
+
+    # Panel 1: motion energy + threshold
+    ax1 = fig.add_subplot(gs[0, 0])
+    # Faint per-signal contributions (fused mode only), beneath the bold total.
+    for col, lab, color in [('z_a', 'keypoint', 'tab:blue'),
+                            ('z_joint', 'joint', 'tab:green'),
+                            ('z_limb', 'limb', 'tab:orange'),
+                            ('z_flow', 'flow', 'tab:purple')]:
+        if col in df.columns and df[col].abs().sum() > 0:
+            ax1.plot(df['mid_time'], df[col], color=color, linewidth=0.8, alpha=0.45, label=lab)
+    ax1.fill_between(df['mid_time'], df['motion_energy'], alpha=0.45, color='steelblue')
+    ax1.plot(df['mid_time'], df['motion_energy'], color='steelblue', linewidth=1.3, label='fused')
+    if 'active_threshold' in df.columns:
+        thr = float(df['active_threshold'].iloc[0])
+        ax1.axhline(thr, color='crimson', linestyle='--', linewidth=1.2, label=f'threshold={thr:.3f}')
+    moving = df[df['state'] == 'moving'] if 'state' in df.columns else df.iloc[0:0]
+    ax1.scatter(moving['mid_time'], moving['motion_energy'], color=_STATE_COLORS['moving'],
+                s=18, zorder=3, label='moving')
+    fused = 'z_joint' in df.columns
+    ax1.set_title('Motion Energy — fused keypoint + joint + limb' if fused
+                  else 'Motion Energy (crop-normalized keypoint variance)')
+    ax1.set_ylabel('motion energy')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylim(bottom=0)
+    ax1.grid(True, axis='y', alpha=0.25)
+    ax1.legend(fontsize=8, loc='upper right')
+
+    # Panel 2: move/still band
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    _state_bands(ax2, df.sort_values('start_time'), y=0.0, height=0.7)
+    ax2.set_yticks([])
+    ax2.set_title('Move / Still')
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylim(-0.5, 0.5)
+    ax2.legend(handles=[Patch(facecolor=_STATE_COLORS[s], label=s) for s in _STATE_COLORS],
+               ncol=2, fontsize=8, loc='upper right')
+
+    # Panel 3: per-body-part energy (stacked area), when region columns exist.
+    if has_regions:
+        ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
+        labels = [c[len('energy_'):] for c in region_cols]
+        ax3.stackplot(df['mid_time'], *[df[c] for c in region_cols],
+                      labels=labels, alpha=0.85)
+        ax3.set_title('Motion Energy by Body Region')
+        ax3.set_ylabel('energy')
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylim(bottom=0)
+        ax3.grid(True, axis='y', alpha=0.25)
+        ax3.legend(fontsize=8, loc='upper right', ncol=min(len(labels), 4))
+
+    plt.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    _LOGGER.info(f"Motion plot -> {output_path}")
+
+
+def plot_all_person_motion(
+    motion_df: pd.DataFrame,
+    output_path: str,
+    title: str = "All-Person Motion Overview",
+) -> None:
+    """Combined move/no-move overview for every tracked person."""
     fig = plt.figure(figsize=(18, 12))
     gs = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[2.3, 2.3, 1.5], hspace=0.42)
 
-    if movement_df.empty:
-        fig.text(0.5, 0.5, "No movement data available", ha='center', va='center', fontsize=14)
+    if motion_df.empty:
+        fig.text(0.5, 0.5, "No motion data available", ha='center', va='center', fontsize=14)
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
-        _LOGGER.info(f"All-person movement graph -> {output_path}")
+        _LOGGER.info(f"All-person motion graph -> {output_path}")
         return
 
-    df = movement_df.copy()
-    df['person_label'] = df['person_id'].apply(lambda x: f"person {int(x)}" if pd.notna(x) else "person")
+    df = motion_df.copy()
     person_ids = sorted(df['person_id'].dropna().unique(), key=lambda x: int(x))
     labels = [f"person {int(pid)}" for pid in person_ids]
     person_colors = dict(zip(person_ids, plt.cm.tab10(np.linspace(0, 1, max(len(person_ids), 1)))))
 
-    # Panel 1: energy over time
+    # Panel 1: motion energy over time
     ax1 = fig.add_subplot(gs[0, 0])
     for pid in person_ids:
         part = df[df['person_id'] == pid].sort_values('mid_time')
-        ax1.plot(
-            part['mid_time'],
-            part['movement_energy'],
-            marker='o',
-            markersize=2.8,
-            linewidth=1.4,
-            color=person_colors[pid],
-            label=f"person {int(pid)}",
-            alpha=0.9,
-        )
-    ax1.set_title('Movement Energy Timeline')
-    ax1.set_ylabel('mean speed')
+        ax1.plot(part['mid_time'], part['motion_energy'], marker='o', markersize=2.8,
+                 linewidth=1.4, color=person_colors[pid], label=f"person {int(pid)}", alpha=0.9)
+    ax1.set_title('Motion Energy Timeline')
+    ax1.set_ylabel('motion energy')
     ax1.set_xlabel('Time (s)')
     ax1.set_ylim(bottom=0)
     ax1.grid(True, axis='y', alpha=0.25)
     ax1.legend(ncol=min(4, max(1, len(person_ids))), fontsize=8, loc='upper right')
 
-    # Panel 2: movement label timeline
+    # Panel 2: move/still bands, one row per person
     ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
     for y, pid in enumerate(person_ids):
         part = df[df['person_id'] == pid].sort_values('start_time')
-        for row in part.itertuples(index=False):
-            movement = str(row.primary_movement)
-            color = _MOVEMENT_COLORS.get(movement, '#8c8c8c')
-            ax2.broken_barh(
-                [(float(row.start_time), max(0.02, float(row.end_time) - float(row.start_time)))],
-                (y - 0.36, 0.72),
-                facecolors=color,
-                edgecolors='white',
-                linewidth=0.35,
-                alpha=0.88,
-            )
+        _state_bands(ax2, part, y=y, height=0.72)
     ax2.set_yticks(range(len(labels)))
     ax2.set_yticklabels(labels)
-    ax2.set_title('Primary Movement Labels')
+    ax2.set_title('Move / Still')
     ax2.set_xlabel('Time (s)')
     ax2.set_ylim(-0.7, len(labels) - 0.3 if labels else 0.7)
     ax2.grid(True, axis='x', alpha=0.2)
-    used_movements = [m for m in _MOVEMENT_COLORS if m in set(df['primary_movement'].astype(str))]
-    ax2.legend(
-        handles=[Patch(facecolor=_MOVEMENT_COLORS[m], label=m) for m in used_movements],
-        ncol=min(4, max(1, len(used_movements))),
-        fontsize=8,
-        loc='upper right',
-    )
+    ax2.legend(handles=[Patch(facecolor=_STATE_COLORS[s], label=s) for s in _STATE_COLORS],
+               ncol=2, fontsize=8, loc='upper right')
 
     # Panel 3: aggregate activity by person
     ax3 = fig.add_subplot(gs[2, 0])
     summary = (
-        df.assign(active=df['primary_movement'] != 'still')
+        df.assign(moving=df['state'] == 'moving')
           .groupby('person_id', as_index=False)
-          .agg(avg_energy=('movement_energy', 'mean'), active_fraction=('active', 'mean'))
+          .agg(avg_energy=('motion_energy', 'mean'), moving_fraction=('moving', 'mean'))
           .sort_values('person_id')
     )
     x = np.arange(len(summary))
@@ -202,108 +317,17 @@ def plot_all_person_movements(
     ax3.bar(x, summary['avg_energy'], color=bar_colors, alpha=0.82)
     ax3.set_xticks(x)
     ax3.set_xticklabels([f"person {int(pid)}" for pid in summary['person_id']])
-    ax3.set_ylabel('avg movement energy')
+    ax3.set_ylabel('avg motion energy')
     ax3.set_title('Aggregate Activity')
     ax3.grid(True, axis='y', alpha=0.25)
 
     ax3b = ax3.twinx()
-    ax3b.plot(x, summary['active_fraction'], color='black', marker='D', linewidth=1.4, label='active fraction')
-    ax3b.set_ylabel('active fraction')
+    ax3b.plot(x, summary['moving_fraction'], color='black', marker='D', linewidth=1.4, label='moving fraction')
+    ax3b.set_ylabel('moving fraction')
     ax3b.set_ylim(0, 1)
     ax3b.legend(fontsize=8, loc='upper right')
 
     plt.suptitle(title, fontsize=15, fontweight='bold', y=0.98)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    _LOGGER.info(f"All-person movement graph -> {output_path}")
-
-
-# ==================== movement analysis plot ====================
-
-def plot_movement_features(
-    feat_df: pd.DataFrame,
-    summary: dict,
-    output_path: str,
-    title: str = "Movement Analysis — Music Listening Session",
-) -> None:
-    t = feat_df['time']
-
-    fig = plt.figure(figsize=(16, 13))
-    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.32)
-
-    # ==================== panel 1: head speed ====================
-    ax1 = fig.add_subplot(gs[0, 0])
-    for kp, col in [('nose', 'tab:blue'), ('left_ear', 'tab:orange'), ('right_ear', 'tab:green')]:
-        sc = f'{kp}_speed'
-        if sc in feat_df.columns:
-            ax1.plot(t, feat_df[sc].fillna(0), label=kp, color=col, alpha=0.85, linewidth=0.9)
-    ax1.set_title('Head Movement Speed')
-    ax1.set_ylabel('shoulder-widths/s')
-    ax1.set_xlabel('Time (s)')
-    ax1.legend(fontsize=8)
-    ax1.set_ylim(bottom=0)
-
-    # ==================== panel 2: wrist / elbow speed ====================
-    ax2 = fig.add_subplot(gs[0, 1])
-    palette = ['tab:red', 'tab:purple', 'tab:brown', 'tab:pink']
-    for (kp, col) in zip(['left_wrist', 'right_wrist', 'left_elbow', 'right_elbow'], palette):
-        sc = f'{kp}_speed'
-        if sc in feat_df.columns:
-            ax2.plot(t, feat_df[sc].fillna(0), label=kp, color=col, alpha=0.85, linewidth=0.9)
-    ax2.set_title('Arm Movement Speed')
-    ax2.set_ylabel('shoulder-widths/s')
-    ax2.set_xlabel('Time (s)')
-    ax2.legend(fontsize=8)
-    ax2.set_ylim(bottom=0)
-
-    # ==================== panel 3: vertical range-of-motion ====================
-    ax3 = fig.add_subplot(gs[1, 0])
-    for kp, col in [('nose', 'tab:blue'), ('left_shoulder', 'tab:cyan'), ('right_shoulder', 'tab:olive')]:
-        yc = f'{kp}_rom_y'
-        if yc in feat_df.columns:
-            ax3.plot(t, feat_df[yc].fillna(0), label=kp, color=col, alpha=0.85, linewidth=0.9)
-    ax3.set_title('Vertical Range of Motion (1 s window)')
-    ax3.set_ylabel('shoulder-widths')
-    ax3.set_xlabel('Time (s)')
-    ax3.legend(fontsize=8)
-
-    # ==================== panel 4: elbow angles ====================
-    ax4 = fig.add_subplot(gs[1, 1])
-    for col, label, color in [('left_elbow_angle', 'Left elbow', 'tab:blue'),
-                               ('right_elbow_angle', 'Right elbow', 'tab:red')]:
-        if col in feat_df.columns:
-            ax4.plot(t, feat_df[col], label=label, color=color, alpha=0.85, linewidth=0.9)
-    ax4.set_title('Elbow Angle')
-    ax4.set_ylabel('degrees')
-    ax4.set_xlabel('Time (s)')
-    ax4.legend(fontsize=8)
-
-    # ==================== panel 5: overall movement energy ====================
-    ax5 = fig.add_subplot(gs[2, 0])
-    speed_cols = [c for c in feat_df.columns if c.endswith('_speed')]
-    if speed_cols:
-        energy = feat_df[speed_cols].fillna(0).mean(axis=1)
-        ax5.fill_between(t, energy, alpha=0.55, color='steelblue')
-        ax5.plot(t, energy, color='steelblue', linewidth=0.8)
-    ax5.set_title('Overall Body Movement Energy')
-    ax5.set_ylabel('mean speed (shoulder-widths/s)')
-    ax5.set_xlabel('Time (s)')
-    ax5.set_ylim(bottom=0)
-
-    # ==================== panel 6: per-keypoint mean speed bar chart ====================
-    ax6 = fig.add_subplot(gs[2, 1])
-    kps = ['nose', 'left_ear', 'right_ear',
-           'left_shoulder', 'right_shoulder',
-           'left_elbow', 'right_elbow',
-           'left_wrist', 'right_wrist']
-    means  = [summary.get(f'{kp}_mean_speed', 0.0) for kp in kps]
-    labels = [kp.replace('left_', 'L.').replace('right_', 'R.') for kp in kps]
-    ax6.bar(labels, means, color='steelblue', alpha=0.8)
-    ax6.set_title('Mean Speed per Keypoint')
-    ax6.set_ylabel('shoulder-widths/s')
-    ax6.tick_params(axis='x', rotation=45)
-
-    plt.suptitle(title, fontsize=14, fontweight='bold', y=1.01)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    _LOGGER.info(f"Movement plot -> {output_path}")
+    _LOGGER.info(f"All-person motion graph -> {output_path}")
