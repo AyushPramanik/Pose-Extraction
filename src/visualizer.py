@@ -156,13 +156,31 @@ def render_person_clip(
 
 
 def _state_bands(ax, part: pd.DataFrame, y: float, height: float) -> None:
-    """Draw move/still broken_barh bands for one person's sorted windows."""
+    """
+    Draw move/still broken_barh bands for one person's sorted windows.
+
+    Consecutive same-state windows are merged into one run and each state is
+    drawn as a single artist — one artist per window made hour-long videos
+    (hundreds of thousands of windows) take tens of minutes to render.
+    """
+    runs: dict[str, list[tuple[float, float]]] = {}
+    cur_state, cur_start, cur_end = None, 0.0, 0.0
     for row in part.itertuples(index=False):
-        color = _STATE_COLORS.get(str(row.state), '#8c8c8c')
+        state, start, end = str(row.state), float(row.start_time), float(row.end_time)
+        if state == cur_state and start <= cur_end:
+            cur_end = max(cur_end, end)
+            continue
+        if cur_state is not None:
+            runs.setdefault(cur_state, []).append((cur_start, max(0.02, cur_end - cur_start)))
+        cur_state, cur_start, cur_end = state, start, end
+    if cur_state is not None:
+        runs.setdefault(cur_state, []).append((cur_start, max(0.02, cur_end - cur_start)))
+
+    for state, ranges in runs.items():
         ax.broken_barh(
-            [(float(row.start_time), max(0.02, float(row.end_time) - float(row.start_time)))],
+            ranges,
             (y - height / 2, height),
-            facecolors=color,
+            facecolors=_STATE_COLORS.get(state, '#8c8c8c'),
             edgecolors='white',
             linewidth=0.35,
             alpha=0.9,
