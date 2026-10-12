@@ -95,6 +95,11 @@ def analyze_person(args: dict) -> dict:
     if signal_b:
         motion_log = corroborate_signal_b(frames, person_id, motion_log, clip_len=num_frames)
 
+    if args['times_only']:
+        # Only the video-level movement-times file is wanted: skip per-person files.
+        return {'label': label, 'motion_summary': {}, 'motion_log': motion_log,
+                'annotation': {'total_frames': 0}}
+
     motion_log.to_csv(stats_path / f'{prefix}_motion_log.csv', index=False)
     write_text_log(motion_log, stats_path / f'{prefix}_motion_log.txt')
     motion_summary = summarize_motion(motion_log)
@@ -141,6 +146,9 @@ class PoseExtractionPipeline():
                             help='Write per-person, per-movement-bout clips to videos/.')
         parser.add_argument('--load-poses', metavar='JSON',
                             help='Skip detection and load a previously saved _poses.json.')
+        parser.add_argument('--times-only', action='store_true',
+                            help='Only write <stem>_movement_times.txt (plus the poses JSON); '
+                                 'skip plots, per-person logs, PYSKL and heatmaps. Fastest.')
         parser.add_argument('--workers', type=int, default=0,
                             help='Worker processes for per-person analysis. '
                                  '0 = auto (min(cpu, n_persons)); 1 = no multiprocessing.')
@@ -305,7 +313,7 @@ class PoseExtractionPipeline():
                 return
 
         # ==================== track-quality diagnostic ====================
-        if not self.args.no_track_report:
+        if not self.args.no_track_report and not self.args.times_only:
             report = track_report(frames, source_fps=fps)
             report_path = self.stats_path / f'{self.stem}_track_report.csv'
             report.to_csv(report_path, index=False)
@@ -358,7 +366,8 @@ class PoseExtractionPipeline():
             'move_threshold': self.args.move_threshold,
             'signal_b': self.args.signal_b,
             'num_frames': self.args.num_frames,
-            'use_heatmap': self.args.motion_mode == 'fused',
+            # The decision uses energy_a only, so heatmaps are skipped in --times-only.
+            'use_heatmap': self.args.motion_mode == 'fused' and not self.args.times_only,
             'heatmap_out_shape': (self.args.heatmap_size, self.args.heatmap_size),
             'with_limb': not self.args.no_limb,
             'fuse_weights': self._parse_fuse_weights(self.args.fuse_weights),
@@ -369,6 +378,7 @@ class PoseExtractionPipeline():
             'flow_weight': self.args.flow_weight,
             'flow_preset': self.args.flow_preset,
             'video_path': self.args.input_video,
+            'times_only': self.args.times_only,
         } for pid in tracker_ids]
 
         workers = self.args.workers or min(os.cpu_count() or 1, n)
@@ -392,10 +402,11 @@ class PoseExtractionPipeline():
         combined_motion = pd.DataFrame()
         if all_motion_logs:
             combined_motion = pd.concat(all_motion_logs, ignore_index=True)
-            combined_motion.to_csv(
-                self.stats_path / f'{self.stem}_all_person_motion_log.csv',
-                index=False,
-            )
+            if not self.args.times_only:
+                combined_motion.to_csv(
+                    self.stats_path / f'{self.stem}_all_person_motion_log.csv',
+                    index=False,
+                )
 
             # Time ranges where at least one person moves (written first: the
             # all-person plot below is slow on long, many-track videos).
@@ -405,17 +416,19 @@ class PoseExtractionPipeline():
                 min_seconds=self.args.segment_min_seconds,
                 min_track_seconds=self.args.min_track_seconds,
             )
-            segments.to_csv(self.stats_path / f'{self.stem}_movement_segments.csv', index=False)
+            if not self.args.times_only:
+                segments.to_csv(self.stats_path / f'{self.stem}_movement_segments.csv', index=False)
             seg_txt = self.output_path / f'{self.stem}_movement_times.txt'
             write_segments_text(segments, seg_txt)
             _LOGGER.info(f"Movement times -> {seg_txt} ({len(segments)} segments)")
 
-            _LOGGER.info("Generating all-person motion graph...")
-            plot_all_person_motion(
-                combined_motion,
-                str(self.stats_path / f'{self.stem}_all_person_motions.png'),
-                title=f"All-Person Motion Overview — {self.stem}",
-            )
+            if not self.args.times_only:
+                _LOGGER.info("Generating all-person motion graph...")
+                plot_all_person_motion(
+                    combined_motion,
+                    str(self.stats_path / f'{self.stem}_all_person_motions.png'),
+                    title=f"All-Person Motion Overview — {self.stem}",
+                )
 
         # ==================== per-person bout clips ====================
         if self.args.split_clips and not combined_motion.empty:
