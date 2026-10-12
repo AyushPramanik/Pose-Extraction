@@ -232,9 +232,15 @@ class PoseExtractionPipeline():
                             help='Merge active bouts separated by a still-gap shorter than this.')
         parser.add_argument('--clip-min-seconds', type=float, default=2.0,
                             help='Drop bouts shorter than this.')
+        # Video-level movement times (any person moving) -> <stem>_movement_times.txt
+        parser.add_argument('--segment-threshold', type=float, default=1e-3,
+                            help='energy_a threshold for the movement-times file. Stricter than '
+                                 '--move-threshold: with several people in frame, the per-person '
+                                 'default flags someone almost all the time.')
+        parser.add_argument('--segment-bridge-seconds', type=float, default=1.0,
+                            help='Merge movement times separated by a gap <= this.')
         parser.add_argument('--segment-min-seconds', type=float, default=0.0,
-                            help='Drop video-level movement segments (any person moving) shorter '
-                                 'than this. Gaps <= --clip-bridge-seconds are merged.')
+                            help='Drop movement times shorter than this.')
         self.args = parser.parse_args()
 
     @staticmethod
@@ -385,29 +391,31 @@ class PoseExtractionPipeline():
 
         combined_motion = pd.DataFrame()
         if all_motion_logs:
-            _LOGGER.info("Generating all-person motion graph...")
             combined_motion = pd.concat(all_motion_logs, ignore_index=True)
             combined_motion.to_csv(
                 self.stats_path / f'{self.stem}_all_person_motion_log.csv',
                 index=False,
             )
+
+            # Time ranges where at least one person moves (written first: the
+            # all-person plot below is slow on long, many-track videos).
+            segments = movement_segments(
+                decide_move_no_move(combined_motion, threshold=self.args.segment_threshold),
+                bridge_seconds=self.args.segment_bridge_seconds,
+                min_seconds=self.args.segment_min_seconds,
+                min_track_seconds=self.args.min_track_seconds,
+            )
+            segments.to_csv(self.stats_path / f'{self.stem}_movement_segments.csv', index=False)
+            seg_txt = self.output_path / f'{self.stem}_movement_times.txt'
+            write_segments_text(segments, seg_txt)
+            _LOGGER.info(f"Movement times -> {seg_txt} ({len(segments)} segments)")
+
+            _LOGGER.info("Generating all-person motion graph...")
             plot_all_person_motion(
                 combined_motion,
                 str(self.stats_path / f'{self.stem}_all_person_motions.png'),
                 title=f"All-Person Motion Overview — {self.stem}",
             )
-
-            # Time ranges where at least one person moves above threshold.
-            segments = movement_segments(
-                combined_motion,
-                bridge_seconds=self.args.clip_bridge_seconds,
-                min_seconds=self.args.segment_min_seconds,
-                min_track_seconds=self.args.min_track_seconds,
-            )
-            segments.to_csv(self.stats_path / f'{self.stem}_movement_segments.csv', index=False)
-            seg_txt = self.stats_path / f'{self.stem}_movement_segments.txt'
-            write_segments_text(segments, seg_txt)
-            _LOGGER.info(f"Movement segments -> {seg_txt.name} ({len(segments)} segments)")
 
         # ==================== per-person bout clips ====================
         if self.args.split_clips and not combined_motion.empty:

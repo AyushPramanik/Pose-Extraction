@@ -480,7 +480,7 @@ def movement_segments(
 
 
 def write_segments_text(segments: pd.DataFrame, output_path: Union[str, Path]) -> None:
-    """One line per segment: `00:30:45 -> 00:32:01  (76s)  persons=1,3`."""
+    """One line per segment: `00:30:45 -> 00:32:01  (76s)` (person IDs are in the CSV)."""
     with open(output_path, 'w') as f:
         for row in segments.itertuples(index=False):
-            f.write(f"{row.start} -> {row.end}  ({row.duration_s:.0f}s)  persons={row.persons}\n")
+            f.write(f"{row.start} -> {row.end}  ({row.duration_s:.0f}s)\n")
