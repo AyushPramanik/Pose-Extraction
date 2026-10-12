@@ -27,7 +27,8 @@ from src.heatmap_volume import (
     pose_compact,
     resize_keypoints,
     render_volume,
-    render_sequence_heatmaps,
+    generate_joint_heatmaps,
+    generate_limb_heatmaps,
     heatmap_diff_energy,
 )
 from src.utils.logger import get_logger
@@ -100,8 +101,8 @@ def compute_motion_energy_windows(
                       `flow_weight`.
         region_energy: also emit per-body-part energies (energy_head, ...).
 
-    The heatmap volume is rendered ONCE for the whole sequence and sliced per
-    window, so cost is one render per person regardless of window count.
+    Heatmaps are rendered per window (on the shared global crop), so memory
+    stays bounded by the window size even on hour-long videos.
 
     Returns the per-window DataFrame, or empty when the person has < 2 frames.
     """
@@ -118,13 +119,10 @@ def compute_motion_energy_windows(
     norm_x = grid_kp[..., 0] / out_w
     norm_y = grid_kp[..., 1] / out_h
 
-    # Render the heatmap volume once (aligned 1:1 to the keypoint rows / timestamps).
-    joint_vol = limb_vol = None
-    if use_heatmap:
-        vols = render_sequence_heatmaps(
-            keypoint, keypoint_score, out_shape=heatmap_out_shape, with_limb=with_limb,
-        )
-        joint_vol, limb_vol = vols['joint'], vols['limb']
+    # Heatmaps share the global crop but are rendered per window: a whole-sequence
+    # volume is (K, T, H, W) and runs to several GB per person on hour-long videos.
+    hm_grid_kp = (resize_keypoints(cropped, crop_shape, heatmap_out_shape)
+                  if use_heatmap else None)
 
     # Optical-flow series aligned to its own timestamps (Stage 4).
     flow_times = flow_mags = None
@@ -155,8 +153,14 @@ def compute_motion_energy_windows(
                                 + _weighted_variance(wy[:, k], ws[:, k]))
             energy_a = float(per_joint.sum())
 
-            energy_joint = heatmap_diff_energy(joint_vol, mask) if joint_vol is not None else 0.0
-            energy_limb = heatmap_diff_energy(limb_vol, mask) if limb_vol is not None else 0.0
+            energy_joint = energy_limb = 0.0
+            if hm_grid_kp is not None:
+                wkp, all_rows = hm_grid_kp[mask], np.ones(n, dtype=bool)
+                energy_joint = heatmap_diff_energy(
+                    generate_joint_heatmaps(wkp, ws, heatmap_out_shape), all_rows)
+                if with_limb:
+                    energy_limb = heatmap_diff_energy(
+                        generate_limb_heatmaps(wkp, ws, out_shape=heatmap_out_shape), all_rows)
 
             fi_win = np.array(frame_indices)[mask]
             valid_conf = ws[ws >= EPS]
@@ -422,3 +426,61 @@ def write_text_log(motion_df: pd.DataFrame, output_path: Union[str, Path]) -> No
 def write_summary_json(summary: dict, output_path: Union[str, Path]) -> None:
     with open(output_path, 'w') as f:
         json.dump(summary, f, indent=2)
+
+
+# ==================== video-level movement segments ====================
+
+def _hms(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def movement_segments(
+        combined_log: pd.DataFrame,
+        bridge_seconds: float = 1.5,
+        min_seconds: float = 0.0,
+        min_track_seconds: float = 0.0,
+    ) -> pd.DataFrame:
+    """
+    Video-level time ranges in which AT LEAST ONE person is moving.
+
+    Takes the union of all persons' moving windows, merges ranges whose gap is
+    <= bridge_seconds, and drops ranges shorter than min_seconds.  Tracks whose
+    total span is < min_track_seconds (pass-through / spurious) are ignored.
+
+    Returns columns: start_time, end_time, duration_s, start, end (HH:MM:SS),
+    persons (comma-separated tracker IDs that moved inside the range).
+    """
+    cols = ['start_time', 'end_time', 'duration_s', 'start', 'end', 'persons']
+    if combined_log.empty or 'is_moving' not in combined_log.columns:
+        return pd.DataFrame(columns=cols)
+
+    span = combined_log.groupby('person_id').agg(t0=('start_time', 'min'), t1=('end_time', 'max'))
+    keep = span.index[(span['t1'] - span['t0']) >= min_track_seconds]
+    moving = combined_log[combined_log['is_moving'] & combined_log['person_id'].isin(keep)]
+    moving = moving.sort_values('start_time')
+
+    merged: list[list] = []   # [start, end, {person ids}]
+    for row in moving.itertuples(index=False):
+        if merged and row.start_time - merged[-1][1] <= bridge_seconds:
+            merged[-1][1] = max(merged[-1][1], row.end_time)
+            merged[-1][2].add(int(row.person_id))
+        else:
+            merged.append([row.start_time, row.end_time, {int(row.person_id)}])
+
+    records = [{
+        'start_time': round(float(s), 3),
+        'end_time': round(float(e), 3),
+        'duration_s': round(float(e - s), 3),
+        'start': _hms(s),
+        'end': _hms(e),
+        'persons': ','.join(str(p) for p in sorted(pids)),
+    } for s, e, pids in merged if e - s >= min_seconds]
+    return pd.DataFrame(records, columns=cols)
+
+
+def write_segments_text(segments: pd.DataFrame, output_path: Union[str, Path]) -> None:
+    """One line per segment: `00:30:45 -> 00:32:01  (76s)  persons=1,3`."""
+    with open(output_path, 'w') as f:
+        for row in segments.itertuples(index=False):
+            f.write(f"{row.start} -> {row.end}  ({row.duration_s:.0f}s)  persons={row.persons}\n")

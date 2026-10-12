@@ -14,6 +14,8 @@ from src.motion_detector import (
     summarize_motion,
     write_text_log,
     write_summary_json,
+    movement_segments,
+    write_segments_text,
 )
 from src.heatmap_volume import to_pyskl_annotation, save_pyskl_pickle
 from src.keypoint_smoothing import SmoothConfig
@@ -230,6 +232,9 @@ class PoseExtractionPipeline():
                             help='Merge active bouts separated by a still-gap shorter than this.')
         parser.add_argument('--clip-min-seconds', type=float, default=2.0,
                             help='Drop bouts shorter than this.')
+        parser.add_argument('--segment-min-seconds', type=float, default=0.0,
+                            help='Drop video-level movement segments (any person moving) shorter '
+                                 'than this. Gaps <= --clip-bridge-seconds are merged.')
         self.args = parser.parse_args()
 
     @staticmethod
@@ -326,8 +331,18 @@ class PoseExtractionPipeline():
             beta=self.args.smooth_beta,
         )
 
+        # Ship each worker only the frames its person appears in (with just that
+        # person) instead of pickling the whole hour of poses once per job.
+        def frames_for(pid: int) -> list[dict]:
+            out = []
+            for f in frames:
+                p = next((p for p in f['persons'] if p.get('tracker_id') == pid), None)
+                if p is not None:
+                    out.append({**f, 'persons': [p]})
+            return out
+
         jobs = [{
-            'frames': frames,
+            'frames': frames_for(pid),
             'fps': fps,
             'person_id': pid,
             'stats_path': str(self.stats_path),
@@ -381,6 +396,18 @@ class PoseExtractionPipeline():
                 str(self.stats_path / f'{self.stem}_all_person_motions.png'),
                 title=f"All-Person Motion Overview — {self.stem}",
             )
+
+            # Time ranges where at least one person moves above threshold.
+            segments = movement_segments(
+                combined_motion,
+                bridge_seconds=self.args.clip_bridge_seconds,
+                min_seconds=self.args.segment_min_seconds,
+                min_track_seconds=self.args.min_track_seconds,
+            )
+            segments.to_csv(self.stats_path / f'{self.stem}_movement_segments.csv', index=False)
+            seg_txt = self.stats_path / f'{self.stem}_movement_segments.txt'
+            write_segments_text(segments, seg_txt)
+            _LOGGER.info(f"Movement segments -> {seg_txt.name} ({len(segments)} segments)")
 
         # ==================== per-person bout clips ====================
         if self.args.split_clips and not combined_motion.empty:

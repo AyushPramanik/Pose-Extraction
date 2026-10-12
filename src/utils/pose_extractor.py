@@ -224,15 +224,22 @@ class PoseExtractor:
             batch_indices.clear()
 
         while cap.isOpened():
+            # Skipped frames are only grabbed (no BGR conversion / copy) —
+            # a large saving on long, high-resolution videos.
+            if frame_idx % stride != 0:
+                if not cap.grab():
+                    break
+                frame_idx += 1
+                continue
+
             ret, frame = cap.read()
             if not ret:
                 break
 
-            if frame_idx % stride == 0:
-                batch_frames.append(frame)
-                batch_indices.append(frame_idx)
-                if len(batch_frames) >= _INFER_BATCH:
-                    flush_batch()
+            batch_frames.append(frame)
+            batch_indices.append(frame_idx)
+            if len(batch_frames) >= _INFER_BATCH:
+                flush_batch()
 
             frame_idx += 1
 
